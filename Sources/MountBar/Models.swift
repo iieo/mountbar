@@ -31,6 +31,7 @@ struct Disk: Decodable, Identifiable, Hashable {
     var endReadable: Bool
     var readableBytes: Int64?
     var partitions: [Partition]
+    var error: String?
 
     var id: String { disk }
     var hasFakeCapacity: Bool { !endReadable && readableBytes != nil }
@@ -54,7 +55,7 @@ struct Partition: Decodable, Identifiable, Hashable {
 
     var displayName: String {
         if let label, !label.isEmpty { return label }
-        return "Partition \(index)"
+        return L.t("partition_n", index)
     }
 
     var fsDisplay: String {
@@ -66,7 +67,7 @@ struct Partition: Decodable, Identifiable, Hashable {
         case "swap": return "Swap"
         case "crypto_LUKS": return "LUKS"
         case "LVM2_member": return "LVM"
-        case nil: return "Unbekannt"
+        case nil: return L.t("fs_unknown")
         default: return fstype!
         }
     }
@@ -75,6 +76,7 @@ struct Partition: Decodable, Identifiable, Hashable {
 struct HelperReply: Decodable {
     var ok: Bool?
     var error: String?
+    var code: String?
     var mountpoint: String?
 }
 

@@ -13,12 +13,12 @@ struct ContentView: View {
                     SetupView()
                 } else if store.anylinuxfsMissing {
                     NoticeView(icon: "shippingbox",
-                               title: "anylinuxfs fehlt",
-                               text: "Installiere es mit\nbrew install nohajc/anylinuxfs/anylinuxfs")
+                               title: L.t("anylinuxfs_missing"),
+                               text: "\(L.t("anylinuxfs_install"))\nbrew install nohajc/anylinuxfs/anylinuxfs")
                 } else if store.disks.isEmpty {
                     NoticeView(icon: store.scanning ? "magnifyingglass" : "externaldrive.badge.questionmark",
-                               title: store.scanning ? "Suche Laufwerke" : "Kein externes Laufwerk",
-                               text: store.scanning ? "" : "Steck ein Laufwerk an. MountBar erkennt es von selbst.")
+                               title: store.scanning ? L.t("searching") : L.t("no_disk"),
+                               text: store.scanning ? "" : L.t("no_disk_text"))
                 } else {
                     ScrollView {
                         VStack(spacing: 10) {
@@ -63,23 +63,27 @@ struct ContentView: View {
             Button {
                 Task { await store.scan() }
             } label: {
-                Image(systemName: "arrow.clockwise")
-                    .rotationEffect(.degrees(store.scanning ? 360 : 0))
-                    .animation(store.scanning ? .linear(duration: 1).repeatForever(autoreverses: false) : .default,
-                               value: store.scanning)
+                ZStack {
+                    Image(systemName: "arrow.clockwise").opacity(store.scanning ? 0 : 1)
+                    if store.scanning {
+                        ProgressView().controlSize(.small).scaleEffect(0.7)
+                    }
+                }
             }
             .buttonStyle(IconButtonStyle())
-            .help("Neu suchen")
-            .disabled(!store.helperReady)
+            .help(L.t("rescan"))
+            .disabled(!store.helperReady || store.scanning)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
     }
 
     private var subtitle: String {
-        let n = store.mounts.count
-        if n == 0 { return "Nichts eingehängt" }
-        return n == 1 ? "1 Laufwerk eingehängt" : "\(n) Laufwerke eingehängt"
+        switch store.mounts.count {
+        case 0: return L.t("nothing_mounted")
+        case 1: return L.t("mounted_one")
+        case let n: return L.t("mounted_many", n)
+        }
     }
 
     private var footer: some View {
@@ -87,15 +91,15 @@ struct ContentView: View {
             Button {
                 withAnimation(.snappy(duration: 0.2)) { showSettings.toggle() }
             } label: {
-                Label("Einstellungen", systemImage: showSettings ? "chevron.down" : "gearshape")
+                Label(L.t("settings"), systemImage: showSettings ? "chevron.down" : "gearshape")
             }
             .buttonStyle(FooterButtonStyle())
             Spacer()
             if store.hasMounts {
-                Button("Alle auswerfen") { Task { await store.unmountAll() } }
+                Button(L.t("eject_all")) { Task { await store.unmountAll() } }
                     .buttonStyle(FooterButtonStyle())
             }
-            Button("Beenden") { NSApp.terminate(nil) }
+            Button(L.t("quit")) { NSApp.terminate(nil) }
                 .buttonStyle(FooterButtonStyle())
                 .keyboardShortcut("q")
         }
@@ -126,7 +130,7 @@ struct DiskCard: View {
             if disk.hasFakeCapacity, let real = disk.readableBytes {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text("Meldet \(formatBytes(disk.size)), lesbar sind nur \(formatBytes(real)). Wird nur lesend eingehängt. Daten bald sichern.")
+                    Text(L.t("fake_capacity", formatBytes(disk.size), formatBytes(real)))
                         .font(.system(size: 11))
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -135,8 +139,13 @@ struct DiskCard: View {
                 .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
 
-            if disk.partitions.isEmpty {
-                Text("Keine Partitionen gefunden")
+            if let err = disk.error {
+                Text("\(L.t("err_disk_read")): \(err)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if disk.partitions.isEmpty {
+                Text(L.t("no_partitions"))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -154,7 +163,7 @@ struct PartitionRow: View {
     @State private var hovering = false
 
     private var key: String { DiskStore.key(disk.disk, part.index) }
-    private var isBusy: Bool { store.busy.contains(key) }
+    private var isBusy: Bool { store.busy.contains(key) || part.mount.map { store.busy.contains($0.mountpoint) } == true }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -171,12 +180,13 @@ struct PartitionRow: View {
                 HStack(spacing: 6) {
                     Text(part.displayName).font(.system(size: 12, weight: .medium)).lineLimit(1)
                     Tag(text: part.fsDisplay)
-                    if let m = part.mount, m.readonly { Tag(text: "Nur lesen") }
+                    if let m = part.mount, m.readonly { Tag(text: L.t("read_only")) }
                 }
                 Text(detail)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
             }
             Spacer(minLength: 4)
             actions
@@ -187,14 +197,14 @@ struct PartitionRow: View {
         .onHover { hovering = $0 }
         .contextMenu {
             if part.mountable && part.mount == nil {
-                Button("Nur lesend einhängen") { Task { await store.mount(disk, part, readOnly: true) } }
                 if part.writable {
-                    Button("Mit Schreibzugriff einhängen") { Task { await store.mount(disk, part, readOnly: false) } }
+                    Button(L.t("mount_rw")) { Task { await store.mount(disk, part, readOnly: false) } }
                 }
+                Button(L.t("mount_ro")) { Task { await store.mount(disk, part, readOnly: true) } }
             }
             if let m = part.mount {
-                Button("Im Finder öffnen") { store.openInFinder(m.mountpoint) }
-                Button("Auswerfen") { Task { await store.unmount(m, key: key) } }
+                Button(L.t("open_in_finder")) { store.openInFinder(m.mountpoint) }
+                Button(L.t("eject")) { Task { await store.unmount(m, key: key) } }
             }
         }
     }
@@ -207,9 +217,9 @@ struct PartitionRow: View {
 
     private var detail: String {
         if let m = part.mount { return m.mountpoint }
-        if let m = part.macosMount { return "\(m) · von macOS eingehängt" }
-        if !part.readable { return "\(formatBytes(part.size)) · nicht lesbar" }
-        if !part.mountable { return "\(formatBytes(part.size)) · wird nicht eingehängt" }
+        if let m = part.macosMount { return "\(m) · \(L.t("by_macos"))" }
+        if !part.readable { return "\(formatBytes(part.size)) · \(L.t("not_readable"))" }
+        if !part.mountable { return "\(formatBytes(part.size)) · \(L.t("not_mountable"))" }
         return formatBytes(part.size)
     }
 
@@ -220,17 +230,17 @@ struct PartitionRow: View {
             HStack(spacing: 4) {
                 Button { store.openInFinder(m.mountpoint) } label: { Image(systemName: "folder") }
                     .buttonStyle(IconButtonStyle())
-                    .help("Im Finder öffnen")
+                    .help(L.t("open_in_finder"))
                 Button { Task { await store.unmount(m, key: key) } } label: { Image(systemName: "eject.fill") }
                     .buttonStyle(IconButtonStyle())
-                    .help("Auswerfen")
+                    .help(L.t("eject"))
             }
         } else if let m = part.macosMount {
             Button { store.openInFinder(m) } label: { Image(systemName: "folder") }
                 .buttonStyle(IconButtonStyle())
-                .help("Im Finder öffnen")
+                .help(L.t("open_in_finder"))
         } else if part.mountable {
-            Button("Einhängen") { Task { await store.mount(disk, part) } }
+            Button(L.t("mount")) { Task { await store.mount(disk, part) } }
                 .buttonStyle(PillButtonStyle())
         }
     }
@@ -245,11 +255,8 @@ struct SetupView: View {
             Image(systemName: "lock.shield")
                 .font(.system(size: 28))
                 .foregroundStyle(.orange)
-            Text(Helper.isInstalled ? "Helfer aktualisieren" : "Einmal einrichten")
-                .font(.system(size: 13, weight: .semibold))
-            Text(Helper.isInstalled
-                 ? "Diese Version von MountBar bringt einen neuen Helfer mit. macOS fragt dafür einmal nach deinem Passwort."
-                 : "MountBar braucht einen kleinen Helfer mit Administratorrechten, um Laufwerke einzuhängen. macOS fragt dafür einmal nach deinem Passwort.")
+            Text(title).font(.system(size: 13, weight: .semibold))
+            Text(text)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -261,12 +268,22 @@ struct SetupView: View {
                     installing = false
                 }
             } label: {
-                if installing { ProgressView().controlSize(.small) } else { Text("Einrichten") }
+                if installing { ProgressView().controlSize(.small) } else { Text(L.t("setup_button")) }
             }
             .buttonStyle(PillButtonStyle(prominent: true))
             .disabled(installing)
         }
         .padding(20)
+    }
+
+    private var title: String {
+        if store.untrusted { return L.t("setup_reconfirm") }
+        return Helper.isInstalled ? L.t("setup_update") : L.t("setup_first")
+    }
+
+    private var text: String {
+        if store.untrusted { return L.t("setup_untrusted_text") }
+        return Helper.isInstalled ? L.t("setup_update_text") : L.t("setup_first_text")
     }
 }
 
@@ -274,16 +291,43 @@ struct SettingsView: View {
     @EnvironmentObject var store: DiskStore
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Toggle("Beim Anstecken automatisch einhängen", isOn: $store.autoMount)
-            Toggle("Standardmäßig nur lesend einhängen", isOn: $store.readOnlyDefault)
-            Toggle("Beim Anmelden starten", isOn: Binding(
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(L.t("auto_mount"), isOn: $store.autoMount)
+                .toggleStyle(.switch)
+            Toggle(L.t("safe_unplug"), isOn: $store.safeUnplug)
+                .toggleStyle(.switch)
+            Text(L.t("safe_unplug_hint"))
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle(L.t("launch_at_login"), isOn: Binding(
                 get: { store.launchAtLogin },
                 set: { store.setLaunchAtLogin($0) }
             ))
+            .toggleStyle(.switch)
+
+            HStack {
+                Text(L.t("default_access"))
+                Spacer()
+                Picker("", selection: $store.readOnlyDefault) {
+                    Text(L.t("access_rw")).tag(false)
+                    Text(L.t("access_ro")).tag(true)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .fixedSize()
+            }
+            HStack {
+                Text(L.t("language"))
+                Spacer()
+                Picker("", selection: $store.language) {
+                    ForEach(Language.allCases) { Text($0.nativeName).tag($0) }
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
         }
-        .toggleStyle(.switch)
-        .controlSize(.mini)
+        .controlSize(.small)
         .font(.system(size: 11))
         .padding(12)
         .transition(.opacity.combined(with: .move(edge: .bottom)))
@@ -371,6 +415,7 @@ struct IconButtonStyle: ButtonStyle {
             .frame(width: 26, height: 26)
             .background(Color.primary.opacity(configuration.isPressed ? 0.12 : 0.06), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
             .contentShape(Rectangle())
+            .fixedSize()
     }
 }
 

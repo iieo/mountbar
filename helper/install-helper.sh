@@ -19,3 +19,7 @@ chmod 440 "$TMP"
 visudo -cf "$TMP" >/dev/null
 install -o root -g wheel -m 440 "$TMP" "$SUDOERS"
 rm -f "$TMP"
+
+# Fingerabdruck von anylinuxfs und util-linux festhalten. Der Helfer verweigert
+# danach jeden Dienst, sobald sich dort etwas ändert.
+env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND "$DEST" trust >/dev/null

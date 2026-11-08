@@ -3,23 +3,35 @@
 Menüleisten-App für macOS, die Linux- und Windows-Laufwerke (ext4, btrfs, xfs, NTFS und mehr)
 über [anylinuxfs](https://github.com/nohajc/anylinuxfs) automatisch einhängt und auswirft.
 
-## Voraussetzungen
+## Installieren
 
 ```
-brew install nohajc/anylinuxfs/anylinuxfs util-linux
+./install.sh
 ```
 
-## Bauen und installieren
+Das Skript prüft Homebrew und Swift, installiert anylinuxfs und util-linux, baut die App und legt
+sie nach `/Applications`. Nur bauen geht mit `./build.sh`, bauen und installieren mit
+`./build.sh --install`.
 
-```
-./build.sh            # baut build/MountBar.app
-./build.sh --install  # kopiert nach /Applications und startet
-```
+## Einstellungen
+
+- Automatisch einhängen beim Anstecken (an)
+- Abziehen ohne Auswerfen (an): Linux-Dateisysteme werden mit `sync` eingehängt, jede Änderung
+  landet sofort auf dem Laufwerk. Wer mitten im Kopieren abzieht, verliert trotzdem die Datei, die
+  gerade geschrieben wird.
+- Standardzugriff: lesen und schreiben (Standard) oder nur lesen
+- Sprache: Englisch (Standard), Deutsch, Französisch, Spanisch
+- Beim Anmelden starten
 
 Beim ersten Start fragt die App einmal nach dem Administratorpasswort. Sie installiert dann
 `/usr/local/libexec/mountbar-helper` (gehört root) und `/etc/sudoers.d/mountbar`, das genau diesen
 Helfer ohne Passwort erlaubt. Ändert sich der Helfer in einer neuen Version, bietet die App an, ihn
 zu aktualisieren.
+
+anylinuxfs und blkid liegen in Homebrew-Ordnern, die dem Nutzer gehören, laufen aber als root. Der
+Helfer speichert deshalb beim Einrichten einen Fingerabdruck (Inode, Größe, ctime) aller Dateien von
+anylinuxfs, util-linux und gettext. Ändert sich etwas, etwa durch `brew upgrade`, verweigert er den
+Dienst, bis du in der App mit deinem Passwort neu bestätigst.
 
 ## Wie es funktioniert
 

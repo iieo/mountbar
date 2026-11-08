@@ -3,10 +3,15 @@
 
 Befehle (Ausgabe immer JSON auf stdout):
   scan                      externe Laufwerke, Partitionen und Mounts
-  mount <diskN> <idx> ro|rw Partition über anylinuxfs einhängen
-  unmount <mountpoint>      anylinuxfs-Mount unter /Volumes aushängen
+  mount <diskN> <idx> ro|rw [sync]
+                            Partition über anylinuxfs einhängen. Mit sync landet
+                            jeder Schreibvorgang sofort auf dem Laufwerk.
+  unmount <mountpoint>      anylinuxfs-Mount aushängen
   status                    aktuelle anylinuxfs-Mounts
+  trust                     Fingerabdruck der Homebrew-Werkzeuge speichern
+                            (nur direkt als root, nicht über sudo)
 """
+import hashlib
 import json
 import os
 import plistlib
@@ -16,49 +21,127 @@ import subprocess
 import sys
 import uuid as uuidlib
 
-ANYLINUXFS = next(
-    (p for p in ("/opt/homebrew/bin/anylinuxfs", "/usr/local/bin/anylinuxfs") if os.path.exists(p)),
-    None,
-)
-BLKID = next(
-    (p for p in ("/opt/homebrew/opt/util-linux/sbin/blkid", "/usr/local/opt/util-linux/sbin/blkid")
-     if os.path.exists(p)),
-    None,
-)
+# sudo behält auf macOS den PATH des Aufrufers. Ohne diese Zeile könnte jeder
+# Prozess des Nutzers eigene Programme als root starten lassen.
+os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+BREW = next((p for p in ("/opt/homebrew", "/usr/local") if os.path.exists(f"{p}/bin/anylinuxfs")), "/opt/homebrew")
+ANYLINUXFS = f"{BREW}/bin/anylinuxfs"
+BLKID = f"{BREW}/opt/util-linux/sbin/blkid"
+DISKUTIL = "/usr/sbin/diskutil"
 STATE_DIR = "/var/db/mountbar"
-SEC = 512
+TRUST_FILE = os.path.join(STATE_DIR, "trust.json")
+PROBE_CACHE = os.path.join(STATE_DIR, "probe-cache.json")
 DISK_RE = re.compile(r"^disk[0-9]+$")
+TIMEOUT = 60
 
 # Dateisysteme, die anylinuxfs einhängen kann und die wir anbieten.
 MOUNTABLE = {"ext2", "ext3", "ext4", "btrfs", "xfs", "ntfs", "f2fs", "exfat", "vfat", "zfs_member"}
 
 
+class HelperFail(Exception):
+    def __init__(self, msg, code="error"):
+        super().__init__(msg)
+        self.code = code
+
+
 def out(obj, code=0):
     json.dump(obj, sys.stdout)
     sys.stdout.write("\n")
+    sys.stdout.flush()
     sys.exit(code)
 
 
-def fail(msg):
-    out({"error": msg}, 1)
-
-
-def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+def run(cmd, timeout=TIMEOUT):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 def plist(cmd):
-    r = subprocess.run(cmd, capture_output=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None
     if r.returncode != 0:
         return None
-    return plistlib.loads(r.stdout)
+    try:
+        return plistlib.loads(r.stdout)
+    except Exception:
+        return None
 
 
-def read_at(dev, off, n):
-    """Ausrichtungssicheres Lesen vom Rohgerät. Gibt None bei Lesefehler zurück."""
-    start = off - off % SEC
+# --- Vertrauen in die Homebrew-Werkzeuge ---------------------------------------
+# anylinuxfs und blkid liegen in Homebrew-Ordnern, die dem Nutzer gehören. Wir
+# merken uns beim Einrichten Inode, Größe und ctime aller beteiligten Dateien.
+# ctime kann ein normaler Nutzer nicht zurücksetzen, jede Änderung fällt also auf.
+
+def trust_roots():
+    roots = [f"{BREW}/bin/anylinuxfs", f"{BREW}/opt/util-linux", f"{BREW}/opt/gettext",
+             f"{BREW}/etc/anylinuxfs.toml"]
+    for link in (f"{BREW}/bin/anylinuxfs", f"{BREW}/opt/util-linux", f"{BREW}/opt/gettext"):
+        real = os.path.realpath(link)
+        if os.path.isfile(real):
+            real = os.path.dirname(os.path.dirname(real))  # Cellar/<name>/<version>
+        roots.append(real)
+    return roots
+
+
+def fingerprint():
+    h = hashlib.sha256()
+
+    def add(path):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            h.update(f"{path}\0missing\n".encode())
+            return
+        target = os.readlink(path) if os.path.islink(path) else ""
+        h.update(f"{path}\0{st.st_dev}\0{st.st_ino}\0{st.st_size}\0{st.st_ctime_ns}\0"
+                 f"{st.st_mode}\0{st.st_uid}\0{target}\n".encode())
+
+    for root in trust_roots():
+        add(root)
+        if os.path.isdir(root) and not os.path.islink(root):
+            for d, dirs, files in os.walk(root):
+                dirs.sort()
+                for name in sorted(dirs + files):
+                    add(os.path.join(d, name))
+    # Auch die Ordner darüber: wer sie umbenennt, könnte ganze Bäume austauschen.
+    for p in (BREW, f"{BREW}/bin", f"{BREW}/opt", f"{BREW}/Cellar", f"{BREW}/etc"):
+        add(p)
+    return h.hexdigest()
+
+
+def check_trust():
+    try:
+        with open(TRUST_FILE) as f:
+            saved = json.load(f).get("fingerprint")
+    except (OSError, ValueError):
+        saved = None
+    if saved != fingerprint():
+        raise HelperFail("anylinuxfs or util-linux changed, for example after an update", "untrusted")
+
+
+def cmd_trust():
+    if "SUDO_USER" in os.environ:
+        raise HelperFail("trust must run as root directly, not via sudo", "bad_command")
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = TRUST_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"fingerprint": fingerprint()}, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, TRUST_FILE)
+    out({"ok": True})
+
+
+# --- Lesen vom Rohgerät -------------------------------------------------------
+
+def read_at(dev, off, n, bs):
+    """Liest n Bytes ab off, ausgerichtet auf die Sektorgröße bs. None bei Lesefehler."""
+    start = off - off % bs
     end = off + n
-    end += (-end) % SEC
+    end += (-end) % bs
+    if n <= 0 or end - start > 64 << 20:
+        return None
     try:
         fd = os.open(dev, os.O_RDONLY)
         try:
@@ -73,34 +156,35 @@ def read_at(dev, off, n):
     return data[off - start: off - start + n]
 
 
-def readable(dev, off):
-    return read_at(dev, max(0, off - SEC), SEC) is not None
+def readable(dev, end_off, bs):
+    return read_at(dev, max(0, end_off - bs), bs, bs) is not None
 
 
-def parse_partitions(rdev):
-    s0 = read_at(rdev, 0, SEC)
+def parse_partitions(rdev, bs, size):
+    s0 = read_at(rdev, 0, 512, bs)
     if s0 is None or s0[510:512] != b"\x55\xaa":
         return "none", []
     entries = [s0[446 + 16 * i: 462 + 16 * i] for i in range(4)]
     if any(e[4] == 0xEE for e in entries):
-        return "gpt", parse_gpt(rdev)
+        return "gpt", parse_gpt(rdev, bs, size)
     parts = []
     for i, e in enumerate(entries):
         ptype = e[4]
         lba, cnt = struct.unpack_from("<II", e, 8)
-        if ptype and cnt:
-            parts.append({"index": i + 1, "start": lba * SEC, "size": cnt * SEC,
-                          "ptype": f"0x{ptype:02x}"})
+        if ptype and cnt and ptype not in (0x05, 0x0F, 0x85):  # erweiterte Partitionen auslassen
+            parts.append({"index": i + 1, "start": lba * bs, "size": cnt * bs, "ptype": f"0x{ptype:02x}"})
     return "mbr", parts
 
 
-def parse_gpt(rdev):
-    hdr = read_at(rdev, SEC, SEC)
+def parse_gpt(rdev, bs, size):
+    hdr = read_at(rdev, bs, 92, bs)
     if hdr is None or hdr[:8] != b"EFI PART":
         return []
     entries_lba, n, esize = struct.unpack_from("<QII", hdr, 72)
+    if not (128 <= esize <= 4096 and esize % 8 == 0) or n == 0:
+        return []
     n = min(n, 256)
-    table = read_at(rdev, entries_lba * SEC, n * esize)
+    table = read_at(rdev, entries_lba * bs, n * esize, bs)
     if table is None:
         return []
     parts = []
@@ -110,15 +194,20 @@ def parse_gpt(rdev):
         if tguid == b"\0" * 16:
             continue
         first, last = struct.unpack_from("<QQ", e, 32)
-        parts.append({"index": i + 1, "start": first * SEC, "size": (last - first + 1) * SEC,
+        if last < first or (size and first * bs >= size):
+            continue
+        parts.append({"index": i + 1, "start": first * bs, "size": (last - first + 1) * bs,
                       "ptype": str(uuidlib.UUID(bytes_le=tguid))})
     return parts
 
 
 def blkid_probe(wdev, start, size):
-    if not BLKID:
+    if not os.path.exists(BLKID):
         return {}
-    r = run([BLKID, "-p", "-o", "export", "-O", str(start), "-S", str(size), wdev])
+    try:
+        r = run([BLKID, "-p", "-o", "export", "-O", str(start), "-S", str(size), wdev], timeout=30)
+    except subprocess.TimeoutExpired:
+        return {}
     info = {}
     for line in r.stdout.splitlines():
         if "=" in line:
@@ -127,14 +216,53 @@ def blkid_probe(wdev, start, size):
     return info
 
 
+def find_readable_end(rdev, size, bs, sector0):
+    """Binäre Suche nach dem Ende des echten Speichers. Ergebnis wird zwischengespeichert,
+    weil jede fehlgeschlagene Leseanfrage ein wackliges Laufwerk zusätzlich belastet."""
+    key = f"{size}:{bs}:{hashlib.sha256(sector0 or b'').hexdigest()}"
+    try:
+        with open(PROBE_CACHE) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if key in cache:
+        return cache[key]
+
+    lo, hi = 0, size // bs
+    step = max(1, (1 << 20) // bs)  # auf 1 MiB genau
+    while hi - lo > step:
+        mid = (lo + hi) // 2
+        if read_at(rdev, mid * bs, bs, bs) is not None:
+            lo = mid
+        else:
+            hi = mid
+    result = lo * bs
+
+    cache = dict(list(cache.items())[-31:])
+    cache[key] = result
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        with open(PROBE_CACHE, "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+    return result
+
+
+STATUS_RE = re.compile(r"^(.+?) on (/.+) \(([^,()]+)((?:, [^()]*)?)\)(?: VM\[.*\])?$")
+
+
 def anylinuxfs_mounts():
     """Liest `anylinuxfs status`: '<ident> on <mountpoint> (<fs>, <opts>…) VM[...]'."""
-    if not ANYLINUXFS:
+    if not os.path.exists(ANYLINUXFS):
         return []
-    r = run([ANYLINUXFS, "status"])
+    try:
+        r = run([ANYLINUXFS, "status"])
+    except subprocess.TimeoutExpired:
+        return []
     mounts = []
     for line in r.stdout.splitlines():
-        m = re.match(r"^(.+?) on (/.+?) \(([^,)]+)((?:, [^)]*)?)\)", line.strip())
+        m = STATUS_RE.match(line.strip())
         if m:
             opts = [o.strip() for o in m.group(4).split(",") if o.strip()]
             mounts.append({"source": m.group(1), "mountpoint": m.group(2), "fstype": m.group(3),
@@ -152,25 +280,18 @@ def mount_source_for(disk, idx, mounts):
 
 
 def scan_disk(disk, mounts):
-    info = plist(["diskutil", "info", "-plist", disk]) or {}
+    info = plist([DISKUTIL, "info", "-plist", disk]) or {}
     size = int(info.get("TotalSize") or info.get("Size") or 0)
+    bs = int(info.get("DeviceBlockSize") or 512)
     rdev, wdev = f"/dev/r{disk}", f"/dev/{disk}"
-    scheme, parts = parse_partitions(rdev)
-    end_readable = readable(rdev, size) if size else False
-
-    readable_bytes = None
-    if not end_readable and size:
-        lo, hi = 0, size // SEC
-        while hi - lo > 2048:  # auf 1 MiB genau
-            mid = (lo + hi) // 2
-            if read_at(rdev, mid * SEC, SEC) is not None:
-                lo = mid
-            else:
-                hi = mid
-        readable_bytes = lo * SEC
+    sector0 = read_at(rdev, 0, bs, bs)
+    scheme, parts = parse_partitions(rdev, bs, size)
+    end_readable = readable(rdev, size, bs) if size else False
+    readable_bytes = None if end_readable or not size else find_readable_end(rdev, size, bs, sector0)
 
     macos_parts = {}
-    for p in (plist(["diskutil", "list", "-plist", disk]) or {}).get("AllDisksAndPartitions", [{}])[0].get("Partitions", []):
+    listing = (plist([DISKUTIL, "list", "-plist", disk]) or {}).get("AllDisksAndPartitions") or [{}]
+    for p in listing[0].get("Partitions", []):
         m = re.match(rf"^{disk}s(\d+)$", p.get("DeviceIdentifier", ""))
         if m:
             macos_parts[int(m.group(1))] = int(p.get("Size", 0))
@@ -179,13 +300,11 @@ def scan_disk(disk, mounts):
     for p in parts:
         probe = blkid_probe(wdev, p["start"], p["size"])
         fstype = probe.get("TYPE")
-        part_end = p["start"] + p["size"]
-        ok = readable(rdev, part_end)
+        ok = readable(rdev, p["start"] + p["size"], bs)
         direct = end_readable and macos_parts.get(p["index"]) == p["size"]
-        mounted = mount_source_for(disk, p["index"], mounts)
         macos_mount = None
         if direct:
-            macos_mount = (plist(["diskutil", "info", "-plist", f"{disk}s{p['index']}"]) or {}).get("MountPoint") or None
+            macos_mount = (plist([DISKUTIL, "info", "-plist", f"{disk}s{p['index']}"]) or {}).get("MountPoint") or None
         result_parts.append({
             "index": p["index"],
             "start": p["start"],
@@ -197,7 +316,7 @@ def scan_disk(disk, mounts):
             "readable": ok,
             "mountable": bool(fstype in MOUNTABLE and ok and not macos_mount),
             "writable": bool(direct),
-            "mount": mounted,
+            "mount": mount_source_for(disk, p["index"], mounts),
             "macosMount": macos_mount,
         })
 
@@ -205,6 +324,7 @@ def scan_disk(disk, mounts):
         "disk": disk,
         "name": (info.get("MediaName") or info.get("IORegistryEntryName") or disk).strip(),
         "size": size,
+        "blockSize": bs,
         "protocol": info.get("BusProtocol"),
         "scheme": scheme,
         "endReadable": end_readable,
@@ -213,30 +333,38 @@ def scan_disk(disk, mounts):
     }
 
 
+def safe_scan_disk(disk, mounts):
+    try:
+        return scan_disk(disk, mounts)
+    except Exception as e:  # ein kaputtes Laufwerk darf die Liste der anderen nicht verhindern
+        return {"disk": disk, "name": disk, "size": 0, "blockSize": 512, "scheme": "none",
+                "endReadable": False, "readableBytes": None, "partitions": [],
+                "error": str(e) or "read error"}
+
+
 def external_disks():
-    d = plist(["diskutil", "list", "-plist", "external", "physical"]) or {}
+    d = plist([DISKUTIL, "list", "-plist", "external", "physical"]) or {}
     return [x for x in d.get("WholeDisks", []) if DISK_RE.match(x)]
 
 
 def cmd_scan():
     mounts = anylinuxfs_mounts()
     out({
-        "anylinuxfs": bool(ANYLINUXFS),
-        "blkid": bool(BLKID),
-        "disks": [scan_disk(d, mounts) for d in external_disks()],
+        "anylinuxfs": os.path.exists(ANYLINUXFS),
+        "blkid": os.path.exists(BLKID),
+        "disks": [safe_scan_disk(d, mounts) for d in external_disks()],
         "mounts": mounts,
     })
 
 
 # --- qcow2-Overlay -----------------------------------------------------------
-# Ein leeres qcow2 mit dem Rohgerät als Backing-Datei. Virtuelle Größe endet am
-# Ende der Partition, damit niemand hinter den echten Speicher liest. Alle
-# Schreibzugriffe landen im Overlay, nie auf dem Gerät.
+# Ein leeres qcow2 mit dem Rohgerät als Backing-Datei. Alle Schreibzugriffe
+# landen im Overlay, nie auf dem Gerät.
 
 def write_qcow2(path, backing, vsize):
     cbits = 16
     cs = 1 << cbits
-    vsize += (-vsize) % SEC
+    vsize += (-vsize) % 512
     l1_size = -(-vsize // (cs * (cs // 8)))
     l1_clusters = max(1, -(-l1_size * 8 // cs))
     refcount_table_off = 1 * cs
@@ -245,9 +373,8 @@ def write_qcow2(path, backing, vsize):
     total_clusters = 3 + l1_clusters
 
     header_len = 104
-    exts = b""
     fmt = b"raw"
-    exts += struct.pack(">II", 0xE2792ACA, len(fmt)) + fmt + b"\0" * ((-len(fmt)) % 8)
+    exts = struct.pack(">II", 0xE2792ACA, len(fmt)) + fmt + b"\0" * ((-len(fmt)) % 8)
     exts += struct.pack(">II", 0, 0)
     backing_b = backing.encode()
     backing_off = header_len + len(exts)
@@ -277,64 +404,87 @@ def write_qcow2(path, backing, vsize):
     os.replace(tmp, path)
 
 
-def cmd_mount(disk, idx, mode):
+def last_line(r):
+    lines = (r.stderr or r.stdout or "").strip().splitlines()
+    return lines[-1] if lines else ""
+
+
+# Kernel-Dateisysteme, die die Option sync verstehen. ntfs-3g läuft über FUSE und
+# schreibt ohnehin ohne großen Zwischenspeicher durch.
+SYNC_CAPABLE = {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat"}
+
+
+def cmd_mount(disk, idx, mode, sync=False):
     if not DISK_RE.match(disk) or disk not in external_disks():
-        fail("Unbekanntes oder kein externes Laufwerk")
+        raise HelperFail("unknown or not an external disk", "unknown_disk")
     if not idx.isdigit():
-        fail("Ungültige Partitionsnummer")
+        raise HelperFail("invalid partition number", "bad_command")
     idx = int(idx)
     if mode not in ("ro", "rw"):
-        fail("Modus muss ro oder rw sein")
-    if not ANYLINUXFS:
-        fail("anylinuxfs ist nicht installiert (brew install nohajc/anylinuxfs/anylinuxfs)")
+        raise HelperFail("mode must be ro or rw", "bad_command")
+    if not os.path.exists(ANYLINUXFS):
+        raise HelperFail("anylinuxfs is not installed", "no_anylinuxfs")
+    check_trust()
 
-    mounts = anylinuxfs_mounts()
-    d = scan_disk(disk, mounts)
+    d = scan_disk(disk, anylinuxfs_mounts())
     part = next((p for p in d["partitions"] if p["index"] == idx), None)
     if not part:
-        fail("Partition nicht gefunden")
+        raise HelperFail("partition not found", "not_found")
     if part["mount"]:
         out({"ok": True, "mountpoint": part["mount"]["mountpoint"], "already": True})
     if not part["mountable"]:
-        fail("Diese Partition lässt sich nicht einhängen")
+        raise HelperFail("partition cannot be mounted", "not_mountable")
 
     if part["writable"]:
         ident = f"/dev/{disk}s{idx}"
     else:
         if mode == "rw":
-            fail("Dieses Laufwerk meldet eine falsche Größe. Es lässt sich nur lesend einhängen.")
+            raise HelperFail("disk reports a wrong size, read only", "fake_rw")
         os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
         ov = overlay_path(disk, idx)
-        vsize = part["start"] + part["size"]
         if d["scheme"] == "gpt":
-            # Linux verwirft eine GPT, deren letzter nutzbarer Block hinter dem Geräteende liegt.
+            # Linux verwirft eine GPT, deren letzter nutzbarer Block hinter dem Geräteende
+            # liegt. Bei GPT braucht das Overlay deshalb die gemeldete Größe. Der Kernel
+            # liest dann einmal die Sicherungs-GPT am Ende, bekommt einen Lesefehler und
+            # nimmt die primäre.
             vsize = d["size"]
+        else:
+            vsize = part["start"] + part["size"]
         write_qcow2(ov, f"/dev/r{disk}", vsize)
         ident = f"{ov}@s{idx}"
 
-    cmd = [ANYLINUXFS, "mount"]
-    if mode == "ro":
-        cmd += ["-o", "ro"]
-    cmd.append(ident)
+    opts = ["ro"] if mode == "ro" else ["rw"]
+    if mode == "rw" and sync and part["fstype"] in SYNC_CAPABLE:
+        opts.append("sync")
+    cmd = [ANYLINUXFS, "mount", "-o", ",".join(opts), ident]
     r = run(cmd, timeout=300)
-    mounts = anylinuxfs_mounts()
-    m = mount_source_for(disk, idx, mounts)
+    m = mount_source_for(disk, idx, anylinuxfs_mounts())
     if r.returncode != 0 or not m:
-        msg = (r.stderr or r.stdout).strip().splitlines()
-        fail(msg[-1] if msg else "Einhängen fehlgeschlagen")
+        raise HelperFail(last_line(r), "mount_failed")
     out({"ok": True, "mountpoint": m["mountpoint"], "readonly": m["readonly"]})
 
 
 def cmd_unmount(mountpoint):
     # Kein realpath: ein NFS-Mount eines abgezogenen Laufwerks würde dabei hängen.
-    mounts = anylinuxfs_mounts()
-    m = next((x for x in mounts if x["mountpoint"] == mountpoint.rstrip("/")), None)
+    m = next((x for x in anylinuxfs_mounts() if x["mountpoint"] == mountpoint.rstrip("/")), None)
     if not m:
-        fail("Kein anylinuxfs-Mount an dieser Stelle")
-    r = run([ANYLINUXFS, "unmount", "--wait-for-vm", "30", m["mountpoint"]], timeout=90)
-    if r.returncode != 0:
-        msg = (r.stderr or r.stdout).strip().splitlines()
-        fail(msg[-1] if msg else "Aushängen fehlgeschlagen")
+        raise HelperFail("no anylinuxfs mount at this path", "no_mount")
+    check_trust()
+    try:
+        r = run([ANYLINUXFS, "unmount", "--wait-for-vm", "30", m["mountpoint"]], timeout=90)
+        failed = r.returncode != 0
+    except subprocess.TimeoutExpired:
+        r, failed = None, True
+    if failed:
+        # Typisch nach dem Abziehen: Die VM ist weg, der NFS-Mount hängt noch.
+        # Dann den Mount hart lösen und die VM ihrerseits aufräumen lassen.
+        try:
+            run(["/sbin/umount", "-f", m["mountpoint"]], timeout=30)
+            run([ANYLINUXFS, "unmount", m["mountpoint"]], timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        if any(x["mountpoint"] == m["mountpoint"] for x in anylinuxfs_mounts()):
+            raise HelperFail(last_line(r) if r else "timeout", "unmount_failed")
     src = m["source"].split("@")[0]
     if src.startswith(STATE_DIR + "/") and src.endswith(".qcow2"):
         try:
@@ -346,22 +496,29 @@ def cmd_unmount(mountpoint):
 
 def main():
     if os.geteuid() != 0:
-        fail("Helfer muss als root laufen")
+        raise HelperFail("helper must run as root", "bad_command")
     args = sys.argv[1:]
+    if args == ["trust"]:
+        cmd_trust()
+    check_trust()
     if args == ["scan"]:
         cmd_scan()
     elif args == ["status"]:
         out({"mounts": anylinuxfs_mounts()})
-    elif len(args) == 4 and args[0] == "mount":
-        cmd_mount(args[1], args[2], args[3])
+    elif len(args) in (4, 5) and args[0] == "mount" and (len(args) == 4 or args[4] == "sync"):
+        cmd_mount(args[1], args[2], args[3], sync=len(args) == 5)
     elif len(args) == 2 and args[0] == "unmount":
         cmd_unmount(args[1])
     else:
-        fail("Unbekannter Befehl")
+        raise HelperFail("unknown command", "bad_command")
 
 
 if __name__ == "__main__":
     try:
         main()
+    except HelperFail as e:
+        out({"error": str(e), "code": e.code}, 1)
     except subprocess.TimeoutExpired:
-        fail("anylinuxfs hat nicht rechtzeitig geantwortet")
+        out({"error": "anylinuxfs timed out", "code": "timeout"}, 1)
+    except Exception as e:
+        out({"error": str(e), "code": "internal"}, 1)

@@ -11,9 +11,19 @@ final class DiskStore: ObservableObject {
     @Published var errorMessage: String?
     @Published var helperReady = Helper.isInstalled && !Helper.isOutdated
     @Published var anylinuxfsMissing = false
+    @Published var untrusted = false
+    @Published var language: Language {
+        didSet {
+            L.language = language
+            UserDefaults.standard.set(language.rawValue, forKey: "language")
+        }
+    }
 
     @Published var autoMount: Bool {
         didSet { UserDefaults.standard.set(autoMount, forKey: "autoMount") }
+    }
+    @Published var safeUnplug: Bool {
+        didSet { UserDefaults.standard.set(safeUnplug, forKey: "safeUnplug") }
     }
     @Published var readOnlyDefault: Bool {
         didSet { UserDefaults.standard.set(readOnlyDefault, forKey: "readOnlyDefault") }
@@ -27,9 +37,13 @@ final class DiskStore: ObservableObject {
     var hasMounts: Bool { !mounts.isEmpty }
 
     init() {
-        UserDefaults.standard.register(defaults: ["autoMount": true, "readOnlyDefault": true])
+        UserDefaults.standard.register(defaults: ["autoMount": true, "readOnlyDefault": false, "safeUnplug": true, "language": "en"])
+        safeUnplug = UserDefaults.standard.bool(forKey: "safeUnplug")
         autoMount = UserDefaults.standard.bool(forKey: "autoMount")
         readOnlyDefault = UserDefaults.standard.bool(forKey: "readOnlyDefault")
+        let lang = Language(rawValue: UserDefaults.standard.string(forKey: "language") ?? "en") ?? .en
+        language = lang
+        L.language = lang
 
         watcher = DiskWatcher()
         watcher?.onAppear = { [weak self] disk in
@@ -84,10 +98,20 @@ final class DiskStore: ObservableObject {
             disks = r.disks
             mounts = r.mounts
             anylinuxfsMissing = !r.anylinuxfs
-        } catch HelperError.notInstalled {
-            helperReady = false
         } catch {
-            errorMessage = error.localizedDescription
+            handle(error)
+        }
+    }
+
+    private func handle(_ error: Error, prefix: String? = nil) {
+        switch error {
+        case HelperError.notInstalled:
+            helperReady = false
+        case HelperError.untrusted:
+            helperReady = false
+            untrusted = true
+        default:
+            errorMessage = [prefix, error.localizedDescription].compactMap { $0 }.joined(separator: ": ")
         }
     }
 
@@ -105,32 +129,34 @@ final class DiskStore: ObservableObject {
         defer { busy.remove(key) }
         let ro = !part.writable || (readOnly ?? readOnlyDefault)
         do {
-            _ = try await Helper.run(["mount", disk.disk, String(part.index), ro ? "ro" : "rw"], as: HelperReply.self)
+            var args = ["mount", disk.disk, String(part.index), ro ? "ro" : "rw"]
+            if !ro && safeUnplug { args.append("sync") }
+            _ = try await Helper.run(args,
+                                     as: HelperReply.self, timeout: 330)
             errorMessage = nil
         } catch {
-            errorMessage = "\(part.displayName): \(error.localizedDescription)"
+            handle(error, prefix: part.displayName)
         }
         await scan()
     }
 
-    func unmount(_ mount: MountInfo, key: String) async {
+    func unmount(_ mount: MountInfo, key: String, rescan: Bool = true) async {
         busy.insert(key)
         defer { busy.remove(key) }
         do {
             _ = try await Helper.run(["unmount", mount.mountpoint], as: HelperReply.self)
             errorMessage = nil
         } catch {
-            errorMessage = error.localizedDescription
+            handle(error)
         }
-        await scan()
+        if rescan { await scan() }
     }
 
     func unmountAll() async {
-        for disk in disks {
-            for part in disk.partitions {
-                if let m = part.mount { await unmount(m, key: Self.key(disk.disk, part.index)) }
-            }
+        for m in mounts {
+            await unmount(m, key: m.mountpoint, rescan: false)
         }
+        await scan()
     }
 
     private func autoMountDisk(_ id: String) async {
@@ -153,10 +179,11 @@ final class DiskStore: ObservableObject {
             try await Helper.install()
             helperReady = Helper.isInstalled && !Helper.isOutdated
             errorMessage = nil
+            untrusted = false
             await scan()
             if autoMount { await autoMountAll() }
         } catch {
-            errorMessage = error.localizedDescription
+            handle(error)
         }
     }
 
@@ -164,7 +191,7 @@ final class DiskStore: ObservableObject {
         do {
             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
         } catch {
-            errorMessage = "Autostart: \(error.localizedDescription)"
+            handle(error, prefix: L.t("autostart"))
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
