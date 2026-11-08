@@ -1,0 +1,367 @@
+#!/usr/bin/python3 -I
+"""Privilegierter Helfer für MountBar. Läuft per sudo als root.
+
+Befehle (Ausgabe immer JSON auf stdout):
+  scan                      externe Laufwerke, Partitionen und Mounts
+  mount <diskN> <idx> ro|rw Partition über anylinuxfs einhängen
+  unmount <mountpoint>      anylinuxfs-Mount unter /Volumes aushängen
+  status                    aktuelle anylinuxfs-Mounts
+"""
+import json
+import os
+import plistlib
+import re
+import struct
+import subprocess
+import sys
+import uuid as uuidlib
+
+ANYLINUXFS = next(
+    (p for p in ("/opt/homebrew/bin/anylinuxfs", "/usr/local/bin/anylinuxfs") if os.path.exists(p)),
+    None,
+)
+BLKID = next(
+    (p for p in ("/opt/homebrew/opt/util-linux/sbin/blkid", "/usr/local/opt/util-linux/sbin/blkid")
+     if os.path.exists(p)),
+    None,
+)
+STATE_DIR = "/var/db/mountbar"
+SEC = 512
+DISK_RE = re.compile(r"^disk[0-9]+$")
+
+# Dateisysteme, die anylinuxfs einhängen kann und die wir anbieten.
+MOUNTABLE = {"ext2", "ext3", "ext4", "btrfs", "xfs", "ntfs", "f2fs", "exfat", "vfat", "zfs_member"}
+
+
+def out(obj, code=0):
+    json.dump(obj, sys.stdout)
+    sys.stdout.write("\n")
+    sys.exit(code)
+
+
+def fail(msg):
+    out({"error": msg}, 1)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def plist(cmd):
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        return None
+    return plistlib.loads(r.stdout)
+
+
+def read_at(dev, off, n):
+    """Ausrichtungssicheres Lesen vom Rohgerät. Gibt None bei Lesefehler zurück."""
+    start = off - off % SEC
+    end = off + n
+    end += (-end) % SEC
+    try:
+        fd = os.open(dev, os.O_RDONLY)
+        try:
+            os.lseek(fd, start, os.SEEK_SET)
+            data = os.read(fd, end - start)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    if len(data) < end - start:
+        return None
+    return data[off - start: off - start + n]
+
+
+def readable(dev, off):
+    return read_at(dev, max(0, off - SEC), SEC) is not None
+
+
+def parse_partitions(rdev):
+    s0 = read_at(rdev, 0, SEC)
+    if s0 is None or s0[510:512] != b"\x55\xaa":
+        return "none", []
+    entries = [s0[446 + 16 * i: 462 + 16 * i] for i in range(4)]
+    if any(e[4] == 0xEE for e in entries):
+        return "gpt", parse_gpt(rdev)
+    parts = []
+    for i, e in enumerate(entries):
+        ptype = e[4]
+        lba, cnt = struct.unpack_from("<II", e, 8)
+        if ptype and cnt:
+            parts.append({"index": i + 1, "start": lba * SEC, "size": cnt * SEC,
+                          "ptype": f"0x{ptype:02x}"})
+    return "mbr", parts
+
+
+def parse_gpt(rdev):
+    hdr = read_at(rdev, SEC, SEC)
+    if hdr is None or hdr[:8] != b"EFI PART":
+        return []
+    entries_lba, n, esize = struct.unpack_from("<QII", hdr, 72)
+    n = min(n, 256)
+    table = read_at(rdev, entries_lba * SEC, n * esize)
+    if table is None:
+        return []
+    parts = []
+    for i in range(n):
+        e = table[i * esize:(i + 1) * esize]
+        tguid = e[:16]
+        if tguid == b"\0" * 16:
+            continue
+        first, last = struct.unpack_from("<QQ", e, 32)
+        parts.append({"index": i + 1, "start": first * SEC, "size": (last - first + 1) * SEC,
+                      "ptype": str(uuidlib.UUID(bytes_le=tguid))})
+    return parts
+
+
+def blkid_probe(wdev, start, size):
+    if not BLKID:
+        return {}
+    r = run([BLKID, "-p", "-o", "export", "-O", str(start), "-S", str(size), wdev])
+    info = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k] = v
+    return info
+
+
+def anylinuxfs_mounts():
+    """Liest `anylinuxfs status`: '<ident> on <mountpoint> (<fs>, <opts>…) VM[...]'."""
+    if not ANYLINUXFS:
+        return []
+    r = run([ANYLINUXFS, "status"])
+    mounts = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"^(.+?) on (/.+?) \(([^,)]+)((?:, [^)]*)?)\)", line.strip())
+        if m:
+            opts = [o.strip() for o in m.group(4).split(",") if o.strip()]
+            mounts.append({"source": m.group(1), "mountpoint": m.group(2), "fstype": m.group(3),
+                           "readonly": "ro" in opts})
+    return mounts
+
+
+def overlay_path(disk, idx):
+    return os.path.join(STATE_DIR, f"{disk}-s{idx}.qcow2")
+
+
+def mount_source_for(disk, idx, mounts):
+    candidates = {f"/dev/{disk}s{idx}", f"{overlay_path(disk, idx)}@s{idx}"}
+    return next((m for m in mounts if m["source"] in candidates), None)
+
+
+def scan_disk(disk, mounts):
+    info = plist(["diskutil", "info", "-plist", disk]) or {}
+    size = int(info.get("TotalSize") or info.get("Size") or 0)
+    rdev, wdev = f"/dev/r{disk}", f"/dev/{disk}"
+    scheme, parts = parse_partitions(rdev)
+    end_readable = readable(rdev, size) if size else False
+
+    readable_bytes = None
+    if not end_readable and size:
+        lo, hi = 0, size // SEC
+        while hi - lo > 2048:  # auf 1 MiB genau
+            mid = (lo + hi) // 2
+            if read_at(rdev, mid * SEC, SEC) is not None:
+                lo = mid
+            else:
+                hi = mid
+        readable_bytes = lo * SEC
+
+    macos_parts = {}
+    for p in (plist(["diskutil", "list", "-plist", disk]) or {}).get("AllDisksAndPartitions", [{}])[0].get("Partitions", []):
+        m = re.match(rf"^{disk}s(\d+)$", p.get("DeviceIdentifier", ""))
+        if m:
+            macos_parts[int(m.group(1))] = int(p.get("Size", 0))
+
+    result_parts = []
+    for p in parts:
+        probe = blkid_probe(wdev, p["start"], p["size"])
+        fstype = probe.get("TYPE")
+        part_end = p["start"] + p["size"]
+        ok = readable(rdev, part_end)
+        direct = end_readable and macos_parts.get(p["index"]) == p["size"]
+        mounted = mount_source_for(disk, p["index"], mounts)
+        macos_mount = None
+        if direct:
+            macos_mount = (plist(["diskutil", "info", "-plist", f"{disk}s{p['index']}"]) or {}).get("MountPoint") or None
+        result_parts.append({
+            "index": p["index"],
+            "start": p["start"],
+            "size": p["size"],
+            "ptype": p["ptype"],
+            "fstype": fstype,
+            "label": probe.get("LABEL"),
+            "uuid": probe.get("UUID"),
+            "readable": ok,
+            "mountable": bool(fstype in MOUNTABLE and ok and not macos_mount),
+            "writable": bool(direct),
+            "mount": mounted,
+            "macosMount": macos_mount,
+        })
+
+    return {
+        "disk": disk,
+        "name": (info.get("MediaName") or info.get("IORegistryEntryName") or disk).strip(),
+        "size": size,
+        "protocol": info.get("BusProtocol"),
+        "scheme": scheme,
+        "endReadable": end_readable,
+        "readableBytes": readable_bytes,
+        "partitions": result_parts,
+    }
+
+
+def external_disks():
+    d = plist(["diskutil", "list", "-plist", "external", "physical"]) or {}
+    return [x for x in d.get("WholeDisks", []) if DISK_RE.match(x)]
+
+
+def cmd_scan():
+    mounts = anylinuxfs_mounts()
+    out({
+        "anylinuxfs": bool(ANYLINUXFS),
+        "blkid": bool(BLKID),
+        "disks": [scan_disk(d, mounts) for d in external_disks()],
+        "mounts": mounts,
+    })
+
+
+# --- qcow2-Overlay -----------------------------------------------------------
+# Ein leeres qcow2 mit dem Rohgerät als Backing-Datei. Virtuelle Größe endet am
+# Ende der Partition, damit niemand hinter den echten Speicher liest. Alle
+# Schreibzugriffe landen im Overlay, nie auf dem Gerät.
+
+def write_qcow2(path, backing, vsize):
+    cbits = 16
+    cs = 1 << cbits
+    vsize += (-vsize) % SEC
+    l1_size = -(-vsize // (cs * (cs // 8)))
+    l1_clusters = max(1, -(-l1_size * 8 // cs))
+    refcount_table_off = 1 * cs
+    refcount_block_off = 2 * cs
+    l1_off = 3 * cs
+    total_clusters = 3 + l1_clusters
+
+    header_len = 104
+    exts = b""
+    fmt = b"raw"
+    exts += struct.pack(">II", 0xE2792ACA, len(fmt)) + fmt + b"\0" * ((-len(fmt)) % 8)
+    exts += struct.pack(">II", 0, 0)
+    backing_b = backing.encode()
+    backing_off = header_len + len(exts)
+    if backing_off + len(backing_b) > cs:
+        raise ValueError("Backing-Pfad zu lang")
+
+    header = struct.pack(
+        ">4sIQIIQIIQQIIQQQQII",
+        b"QFI\xfb", 3, backing_off, len(backing_b), cbits, vsize, 0,
+        l1_size, l1_off, refcount_table_off, 1, 0, 0,
+        0, 0, 0, 4, header_len,
+    )
+    assert len(header) == header_len
+
+    buf = bytearray(total_clusters * cs)
+    buf[0:header_len] = header
+    buf[header_len:header_len + len(exts)] = exts
+    buf[backing_off:backing_off + len(backing_b)] = backing_b
+    struct.pack_into(">Q", buf, refcount_table_off, refcount_block_off)
+    for c in range(total_clusters):
+        struct.pack_into(">H", buf, refcount_block_off + 2 * c, 1)
+
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(buf)
+    os.replace(tmp, path)
+
+
+def cmd_mount(disk, idx, mode):
+    if not DISK_RE.match(disk) or disk not in external_disks():
+        fail("Unbekanntes oder kein externes Laufwerk")
+    if not idx.isdigit():
+        fail("Ungültige Partitionsnummer")
+    idx = int(idx)
+    if mode not in ("ro", "rw"):
+        fail("Modus muss ro oder rw sein")
+    if not ANYLINUXFS:
+        fail("anylinuxfs ist nicht installiert (brew install nohajc/anylinuxfs/anylinuxfs)")
+
+    mounts = anylinuxfs_mounts()
+    d = scan_disk(disk, mounts)
+    part = next((p for p in d["partitions"] if p["index"] == idx), None)
+    if not part:
+        fail("Partition nicht gefunden")
+    if part["mount"]:
+        out({"ok": True, "mountpoint": part["mount"]["mountpoint"], "already": True})
+    if not part["mountable"]:
+        fail("Diese Partition lässt sich nicht einhängen")
+
+    if part["writable"]:
+        ident = f"/dev/{disk}s{idx}"
+    else:
+        if mode == "rw":
+            fail("Dieses Laufwerk meldet eine falsche Größe. Es lässt sich nur lesend einhängen.")
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        ov = overlay_path(disk, idx)
+        vsize = part["start"] + part["size"]
+        if d["scheme"] == "gpt":
+            # Linux verwirft eine GPT, deren letzter nutzbarer Block hinter dem Geräteende liegt.
+            vsize = d["size"]
+        write_qcow2(ov, f"/dev/r{disk}", vsize)
+        ident = f"{ov}@s{idx}"
+
+    cmd = [ANYLINUXFS, "mount"]
+    if mode == "ro":
+        cmd += ["-o", "ro"]
+    cmd.append(ident)
+    r = run(cmd, timeout=300)
+    mounts = anylinuxfs_mounts()
+    m = mount_source_for(disk, idx, mounts)
+    if r.returncode != 0 or not m:
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        fail(msg[-1] if msg else "Einhängen fehlgeschlagen")
+    out({"ok": True, "mountpoint": m["mountpoint"], "readonly": m["readonly"]})
+
+
+def cmd_unmount(mountpoint):
+    # Kein realpath: ein NFS-Mount eines abgezogenen Laufwerks würde dabei hängen.
+    mounts = anylinuxfs_mounts()
+    m = next((x for x in mounts if x["mountpoint"] == mountpoint.rstrip("/")), None)
+    if not m:
+        fail("Kein anylinuxfs-Mount an dieser Stelle")
+    r = run([ANYLINUXFS, "unmount", "--wait-for-vm", "30", m["mountpoint"]], timeout=90)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        fail(msg[-1] if msg else "Aushängen fehlgeschlagen")
+    src = m["source"].split("@")[0]
+    if src.startswith(STATE_DIR + "/") and src.endswith(".qcow2"):
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+    out({"ok": True})
+
+
+def main():
+    if os.geteuid() != 0:
+        fail("Helfer muss als root laufen")
+    args = sys.argv[1:]
+    if args == ["scan"]:
+        cmd_scan()
+    elif args == ["status"]:
+        out({"mounts": anylinuxfs_mounts()})
+    elif len(args) == 4 and args[0] == "mount":
+        cmd_mount(args[1], args[2], args[3])
+    elif len(args) == 2 and args[0] == "unmount":
+        cmd_unmount(args[1])
+    else:
+        fail("Unbekannter Befehl")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.TimeoutExpired:
+        fail("anylinuxfs hat nicht rechtzeitig geantwortet")
