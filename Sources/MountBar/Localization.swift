@@ -46,6 +46,7 @@ enum L {
                          .fr: "Branche un disque. MountBar le détecte tout seul.",
                          .es: "Conecta una unidad. MountBar la detecta solo."],
         "settings": [.en: "Settings", .de: "Einstellungen", .fr: "Réglages", .es: "Ajustes"],
+        "back": [.en: "Back", .de: "Zurück", .fr: "Retour", .es: "Volver"],
         "eject_all": [.en: "Eject all", .de: "Alle auswerfen", .fr: "Tout éjecter", .es: "Expulsar todo"],
         "quit": [.en: "Quit", .de: "Beenden", .fr: "Quitter", .es: "Salir"],
         "fake_capacity": [
@@ -89,10 +90,10 @@ enum L {
             .fr: "Cette version de MountBar apporte un nouvel assistant. macOS te demande ton mot de passe une fois.",
             .es: "Esta versión de MountBar trae un asistente nuevo. macOS te pedirá la contraseña una vez."],
         "setup_untrusted_text": [
-            .en: "anylinuxfs or util-linux changed, probably through a Homebrew update. For safety the helper stops until you confirm with your password.",
-            .de: "anylinuxfs oder util-linux hat sich geändert, wahrscheinlich durch ein Homebrew-Update. Zur Sicherheit pausiert der Helfer, bis du mit deinem Passwort bestätigst.",
-            .fr: "anylinuxfs ou util-linux a changé, sans doute après une mise à jour Homebrew. Par sécurité, l’assistant attend ta confirmation avec ton mot de passe.",
-            .es: "anylinuxfs o util-linux ha cambiado, seguramente por una actualización de Homebrew. Por seguridad, el asistente espera a que confirmes con tu contraseña."],
+            .en: "A Homebrew package MountBar relies on has changed, probably through an update. For safety the helper pauses until you confirm with your password. Drives stay mounted until then, so don't unplug them.",
+            .de: "Ein Homebrew-Paket, das MountBar nutzt, hat sich geändert, wahrscheinlich durch ein Update. Zur Sicherheit pausiert der Helfer, bis du mit deinem Passwort bestätigst. Bis dahin bleiben Laufwerke eingehängt, zieh sie also nicht ab.",
+            .fr: "Un paquet Homebrew utilisé par MountBar a changé, sans doute après une mise à jour. Par sécurité, l’assistant attend ta confirmation avec ton mot de passe. D’ici là, les disques restent montés, ne les débranche pas.",
+            .es: "Un paquete de Homebrew que usa MountBar ha cambiado, seguramente por una actualización. Por seguridad, el asistente espera a que confirmes con tu contraseña. Hasta entonces las unidades siguen montadas, no las desconectes."],
         "setup_button": [.en: "Set up", .de: "Einrichten", .fr: "Configurer", .es: "Configurar"],
 
         "auto_mount": [.en: "Mount automatically when plugged in", .de: "Beim Anstecken automatisch einhängen",
@@ -124,6 +125,10 @@ enum L {
             .fr: "macOS ne sait que lire le NTFS. MountBar reprend le disque avec accès en écriture.",
             .es: "macOS solo puede leer NTFS. MountBar se hace cargo de la unidad con escritura."],
         "changed_packages": [.en: "Changed: %@", .de: "Geändert: %@", .fr: "Modifié : %@", .es: "Cambiado: %@"],
+        "err_locked": [.en: "MountBar is still working on this drive. Wait a moment and try again.",
+                       .de: "MountBar ist mit diesem Laufwerk noch beschäftigt. Warte kurz und versuch es noch einmal.",
+                       .fr: "MountBar travaille encore sur ce disque. Patiente un instant et réessaie.",
+                       .es: "MountBar sigue trabajando con esta unidad. Espera un momento y vuelve a intentarlo."],
         "err_busy": [.en: "The drive is in use. Close the programs that use it and try again.",
                      .de: "Das Laufwerk wird gerade benutzt. Schließe die Programme, die darauf zugreifen, und versuch es noch einmal.",
                      .fr: "Le disque est en cours d’utilisation. Ferme les programmes qui l’utilisent et réessaie.",

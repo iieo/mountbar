@@ -46,7 +46,24 @@ Dienst, bis du in der App mit deinem Passwort neu bestätigst.
   `/var/db/mountbar/` ein leeres qcow2-Overlay an, das auf das Rohgerät zeigt und am Ende der
   Partition aufhört. Solche Laufwerke werden nur lesend eingehängt, und Schreibzugriffe würden im
   Overlay landen, nie auf dem Gerät.
-- Partitionen, die macOS schon selbst eingehängt hat, fasst die App nicht an.
+- exFAT und FAT überlässt die App macOS. NTFS hängt macOS nur lesend ein. Auf Klick auf
+  „Schreiben erlauben“ löst MountBar diesen Mount und hängt die Partition über anylinuxfs mit
+  Schreibzugriff ein. Scheitert das, stellt der Helfer den macOS-Mount wieder her.
+
+## Bekannte Grenzen
+
+- anylinuxfs, util-linux und gettext liegen in Homebrew-Ordnern, die dem Nutzer gehören, und laufen
+  als root. Der Fingerabdruck erkennt Änderungen, aber zwischen Prüfung und Start liegen einige
+  Sekunden. Schadsoftware, die schon als dein Benutzer läuft, könnte diese Lücke nutzen. Ganz
+  schließen ließe sich das nur, wenn MountBar geprüfte Kopien der Pakete an einem Ort ablegt, der
+  root gehört.
+- Das mitgelieferte Helfer-Skript liegt im App-Bundle, das dir gehört. Wer das Bundle verändert,
+  kann beim nächsten „Helfer aktualisieren“ eigenen Code einschleusen. Ein signierter
+  Hintergrunddienst (`SMAppService`) würde das lösen.
+- Der Finder zeigt anylinuxfs-Laufwerke als Server (`disk16s1.local`), weil anylinuxfs sie per NFS
+  bereitstellt.
+- Gefälschte Laufwerke, die beim Lesen hinter dem echten Speicher wieder von vorn anfangen, statt
+  einen Fehler zu melden, erkennt MountBar nicht.
 
 ## Deinstallieren
 

@@ -107,10 +107,14 @@ final class DiskStore: ObservableObject {
             await running.value
             return
         }
-        let task = Task { await self.scanLoop() }
+        let task = Task {
+            await self.scanLoop()
+            // Hier zurücksetzen, nicht beim Aufrufer: sonst ginge eine Anfrage verloren,
+            // die zwischen Ende der Schleife und Rückkehr des Aufrufers eintrifft.
+            self.scanTask = nil
+        }
         scanTask = task
         await task.value
-        scanTask = nil
     }
 
     private func scanLoop() async {
@@ -179,7 +183,8 @@ final class DiskStore: ObservableObject {
         await scan()
     }
 
-    func unmount(_ mount: MountInfo, key: String, rescan: Bool = true) async {
+    func unmount(_ mount: MountInfo, rescan: Bool = true) async {
+        let key = Self.ejectKey(mount)
         guard !busy.contains(key) else { return }
         busy.insert(key)
         defer { busy.remove(key) }
@@ -192,9 +197,12 @@ final class DiskStore: ObservableObject {
         if rescan { await scan() }
     }
 
+    /// Busy-Schlüssel fürs Auswerfen. Zeile und "Alle auswerfen" müssen denselben nutzen.
+    static func ejectKey(_ m: MountInfo) -> String { "eject:\(m.mountpoint)" }
+
     func unmountAll() async {
         for m in mounts {
-            await unmount(m, key: m.mountpoint, rescan: false)
+            await unmount(m, rescan: false)
         }
         await scan()
     }
@@ -215,7 +223,9 @@ final class DiskStore: ObservableObject {
     }
 
     func installHelper() async {
-        let firstInstall = !Helper.isInstalled
+        // Nur die Helfer-Datei zählt: Wer von der alten gemeinsamen sudoers-Datei kommt,
+        // aktualisiert und installiert nicht zum ersten Mal.
+        let firstInstall = !FileManager.default.fileExists(atPath: Helper.path)
         do {
             try await Helper.install()
             untrusted = false

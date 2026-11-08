@@ -16,6 +16,7 @@ struct MountInfo: Decodable, Hashable {
     var mountpoint: String
     var fstype: String
     var readonly: Bool
+    var sync: Bool?
 
     var diskID: String? {
         source.range(of: #"disk[0-9]+"#, options: .regularExpression).map { String(source[$0]) }

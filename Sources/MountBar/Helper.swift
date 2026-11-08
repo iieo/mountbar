@@ -7,7 +7,7 @@ enum HelperError: LocalizedError {
 
     /// Bei diesen Codes ist der englische Zusatz des Helfers die eigentliche Ursache
     /// (Ausgabe von anylinuxfs oder Python). Bei allen anderen reicht der übersetzte Text.
-    private static let codesWithDetail: Set<String> = ["mount_failed", "unmount_failed", "busy", "internal", "unexpected"]
+    private static let codesWithDetail: Set<String> = ["mount_failed", "unmount_failed", "internal", "unexpected"]
 
     var errorDescription: String? {
         switch self {

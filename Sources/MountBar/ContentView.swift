@@ -9,7 +9,9 @@ struct ContentView: View {
             header
             Divider().opacity(0.5)
             Group {
-                if !store.helperReady {
+                if showSettings {
+                    Scrollable { SettingsView() }
+                } else if !store.helperReady {
                     SetupView()
                 } else if store.anylinuxfsMissing {
                     NoticeView(icon: "shippingbox",
@@ -20,23 +22,18 @@ struct ContentView: View {
                                title: store.scanning ? L.t("searching") : L.t("no_disk"),
                                text: store.scanning ? "" : L.t("no_disk_text"))
                 } else {
-                    ScrollView {
+                    Scrollable {
                         VStack(spacing: 10) {
                             ForEach(store.disks) { DiskCard(disk: $0) }
                         }
                         .padding(12)
                     }
-                    .frame(maxHeight: 420)
                 }
             }
             if let err = store.errorMessage {
                 ErrorBanner(text: err) { store.errorMessage = nil }
                     .padding(.horizontal, 12)
                     .padding(.bottom, 8)
-            }
-            if showSettings {
-                Divider().opacity(0.5)
-                SettingsView()
             }
             Divider().opacity(0.5)
             footer
@@ -91,11 +88,11 @@ struct ContentView: View {
             Button {
                 withAnimation(.snappy(duration: 0.2)) { showSettings.toggle() }
             } label: {
-                Label(L.t("settings"), systemImage: showSettings ? "chevron.down" : "gearshape")
+                Label(showSettings ? L.t("back") : L.t("settings"), systemImage: showSettings ? "chevron.left" : "gearshape")
             }
             .buttonStyle(FooterButtonStyle())
             Spacer()
-            if store.hasMounts {
+            if store.hasMounts && store.helperReady && !showSettings {
                 Button(L.t("eject_all")) { Task { await store.unmountAll() } }
                     .buttonStyle(FooterButtonStyle())
             }
@@ -105,6 +102,21 @@ struct ContentView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
+    }
+}
+
+/// Nimmt nur so viel Höhe wie der Inhalt braucht und scrollt erst darüber.
+/// Ein Menüleistenfenster wächst sonst über den Bildschirmrand hinaus.
+struct Scrollable<Content: View>: View {
+    var maxHeight: CGFloat = 440
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        ViewThatFits(in: .vertical) {
+            content
+            ScrollView { content }.frame(height: maxHeight)
+        }
+        .frame(maxHeight: maxHeight)
     }
 }
 
@@ -163,7 +175,7 @@ struct PartitionRow: View {
     @State private var hovering = false
 
     private var key: String { DiskStore.key(disk.disk, part.index) }
-    private var isBusy: Bool { store.busy.contains(key) || part.mount.map { store.busy.contains($0.mountpoint) } == true }
+    private var isBusy: Bool { store.busy.contains(key) || part.mount.map { store.busy.contains(DiskStore.ejectKey($0)) } == true }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -181,7 +193,7 @@ struct PartitionRow: View {
                     Text(part.displayName).font(.system(size: 12, weight: .medium)).lineLimit(1)
                     Tag(text: part.fsDisplay)
                     if let m = part.mount, m.readonly { Tag(text: L.t("read_only")) }
-                    if let m = part.mount, !m.readonly, !(part.syncSafe && store.safeUnplug) {
+                    if let m = part.mount, !m.readonly, m.sync != true {
                         Tag(text: L.t("eject_first"))
                             .help(L.t("eject_first_hint"))
                     }
@@ -211,7 +223,7 @@ struct PartitionRow: View {
                 }
                 if let m = part.mount {
                     Button(L.t("open_in_finder")) { store.openInFinder(m.mountpoint) }
-                    Button(L.t("eject")) { Task { await store.unmount(m, key: key) } }
+                    Button(L.t("eject")) { Task { await store.unmount(m) } }
                 }
             }
         }
@@ -239,7 +251,7 @@ struct PartitionRow: View {
                 Button { store.openInFinder(m.mountpoint) } label: { Image(systemName: "folder") }
                     .buttonStyle(IconButtonStyle())
                     .help(L.t("open_in_finder"))
-                Button { Task { await store.unmount(m, key: key) } } label: { Image(systemName: "eject.fill") }
+                Button { Task { await store.unmount(m) } } label: { Image(systemName: "eject.fill") }
                     .buttonStyle(IconButtonStyle())
                     .help(L.t("eject"))
             }
@@ -351,7 +363,6 @@ struct SettingsView: View {
         .controlSize(.small)
         .font(.system(size: 11))
         .padding(12)
-        .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
 }
 

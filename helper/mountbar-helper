@@ -14,6 +14,8 @@ Befehle (Ausgabe immer JSON auf stdout):
 """
 import fcntl
 import hashlib
+import signal
+import time
 import json
 import os
 import plistlib
@@ -64,13 +66,62 @@ def out(obj, code=0):
     sys.exit(code)
 
 
+# Gesamtfrist für einen Aufruf. Die App wartet etwas länger, damit nie die App den
+# Helfer abbricht, während ein anylinuxfs-Kindprozess weiterläuft.
+DEADLINE = None
+_child = None
+
+
+def remaining(timeout):
+    if DEADLINE is None:
+        return timeout
+    left = DEADLINE - time.monotonic()
+    if left <= 1:
+        raise subprocess.TimeoutExpired("deadline", 0)
+    return min(timeout, left)
+
+
 def run(cmd, timeout=TIMEOUT):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    """Wie subprocess.run, aber in eigener Prozessgruppe, die bei Abbruch ganz beendet wird."""
+    global _child
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         start_new_session=True)
+    _child = p
+    try:
+        out_, err_ = p.communicate(timeout=remaining(timeout))
+    except subprocess.TimeoutExpired:
+        _kill_group(p)
+        p.communicate()
+        raise
+    finally:
+        _child = None
+    return subprocess.CompletedProcess(cmd, p.returncode, out_, err_)
+
+
+def _kill_group(p):
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+        p.wait(timeout=5)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _on_term(signum, frame):
+    if _child is not None:
+        _kill_group(_child)
+    sys.exit(1)
+
+
+signal.signal(signal.SIGTERM, _on_term)
+signal.signal(signal.SIGHUP, _on_term)
 
 
 def plist(cmd):
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=TIMEOUT)
+        r = subprocess.run(cmd, capture_output=True, timeout=remaining(TIMEOUT))
     except subprocess.TimeoutExpired:
         return None
     if r.returncode != 0:
@@ -191,7 +242,7 @@ class DiskLock:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(self.fd)
-            raise HelperFail("another operation on this disk is running", "busy")
+            raise HelperFail("another operation on this disk is running", "locked")
         return self
 
     def __exit__(self, *exc):
@@ -330,7 +381,7 @@ def anylinuxfs_mounts():
         if m:
             opts = [o.strip() for o in m.group(4).split(",") if o.strip()]
             mounts.append({"source": m.group(1), "mountpoint": m.group(2), "fstype": m.group(3),
-                           "readonly": "ro" in opts})
+                           "readonly": "ro" in opts, "sync": "sync" in opts})
     return mounts
 
 
@@ -384,12 +435,13 @@ def scan_disk(disk, mounts):
         ok = readable(rdev, p["start"] + p["size"], bs)
         direct = end_readable and macos_parts.get(p["index"]) == p["size"]
         macos_mount = None
-        if direct:
+        # Auch bei Laufwerken mit falscher Größe: macOS hängt seine Partitionen trotzdem ein.
+        if p["index"] in macos_parts:
             macos_mount = (plist([DISKUTIL, "info", "-plist", f"{disk}s{p['index']}"]) or {}).get("MountPoint") or None
         mountable = fstype in MOUNTABLE and ok
         if direct and fstype in MACOS_NATIVE:
             mountable = False  # macOS kümmert sich selbst darum
-        if macos_mount and fstype != "ntfs":
+        if macos_mount and (fstype != "ntfs" or not direct):
             mountable = False
         # NTFS hängt macOS nur lesend ein. Schreibzugriff gibt es auf Wunsch über
         # anylinuxfs, aber nie automatisch, sonst kollidieren wir mit macOS.
@@ -543,12 +595,14 @@ def _mount_locked(disk, idx, mode, sync):
         write_qcow2(ov, f"/dev/r{disk}", vsize)
         ident = f"{ov}@s{idx}"
 
+    took_from_macos = False
     if part["macosMount"]:
         # Nur bei NTFS möglich: den Nur-Lesen-Mount von macOS lösen, damit anylinuxfs
         # das Laufwerk exklusiv bekommt.
         r = run([DISKUTIL, "unmount", f"/dev/{disk}s{idx}"], timeout=60)
         if r.returncode != 0:
             raise HelperFail(last_line(r), "busy")
+        took_from_macos = True
 
     opts = ["ro"] if mode == "ro" else ["rw"]
     if mode == "rw" and sync and part["fstype"] in SYNC_CAPABLE:
@@ -556,10 +610,18 @@ def _mount_locked(disk, idx, mode, sync):
     if mode == "ro" and part["fstype"] in NO_REPLAY:
         opts.append(NO_REPLAY[part["fstype"]])
     cmd = [ANYLINUXFS, "mount", "-o", ",".join(opts), ident]
-    r = run(cmd, timeout=300)
-    m = mount_source_for(disk, idx, anylinuxfs_mounts())
-    if r.returncode != 0 or not m:
-        raise HelperFail(last_line(r), "mount_failed")
+    try:
+        r = run(cmd, timeout=300)
+        m = mount_source_for(disk, idx, anylinuxfs_mounts())
+        ok = r.returncode == 0 and m
+    except subprocess.TimeoutExpired:
+        r, m, ok = None, None, False
+    if not ok:
+        if took_from_macos:
+            # Etwa ein Windows im Ruhezustand: ntfs-3g verweigert Schreiben. Dann
+            # wenigstens den Nur-Lesen-Zugriff von macOS wiederherstellen.
+            subprocess.run([DISKUTIL, "mount", f"/dev/{disk}s{idx}"], capture_output=True, timeout=60)
+        raise HelperFail(last_line(r) if r else "timeout", "mount_failed")
     out({"ok": True, "mountpoint": m["mountpoint"], "readonly": m["readonly"]})
 
 
@@ -577,8 +639,12 @@ def cmd_unmount(mountpoint):
         if not nfs:
             raise HelperFail("no anylinuxfs mount at this path", "no_mount")
         disk = disk_of(nfs["server"])
-        gone = bool(disk) and not os.path.exists(f"/dev/{disk}")
-        r = run(["/sbin/umount"] + (["-f"] if gone else []) + [mountpoint], timeout=30)
+        if disk and os.path.exists(f"/dev/{disk}"):
+            # Sauber aushängen kann nur anylinuxfs selbst, und das starten wir erst nach
+            # der Bestätigung. Sonst liefe die VM mit eingehängtem Dateisystem weiter.
+            check_trust()
+        # Laufwerk ist weg: nur den hängenden Mount auf macOS-Seite lösen.
+        r = run(["/sbin/umount", "-f", mountpoint], timeout=30)
         if r.returncode != 0:
             raise HelperFail(last_line(r), "busy")
         out({"ok": True})
@@ -622,7 +688,10 @@ def _unmount_locked(m, disk):
 def main():
     if os.geteuid() != 0:
         raise HelperFail("helper must run as root", "bad_command")
+    global DEADLINE
     args = sys.argv[1:]
+    # Die App wartet bei mount 330 s, sonst mindestens 150 s.
+    DEADLINE = time.monotonic() + (300 if args[:1] == ["mount"] else 140)
     if args == ["trust"]:
         cmd_trust()
     if len(args) == 2 and args[0] == "unmount":
