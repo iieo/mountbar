@@ -6,7 +6,7 @@ set -euo pipefail
 SRC="$1"
 USER_NAME="$2"
 DEST=/usr/local/libexec/mountbar-helper
-SUDOERS=/etc/sudoers.d/mountbar
+SUDOERS="/etc/sudoers.d/mountbar-$2"
 
 [[ "$USER_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Ungültiger Benutzername" >&2; exit 1; }
 
@@ -19,6 +19,8 @@ chmod 440 "$TMP"
 visudo -cf "$TMP" >/dev/null
 install -o root -g wheel -m 440 "$TMP" "$SUDOERS"
 rm -f "$TMP"
+# Ältere Versionen nutzten eine gemeinsame Datei für alle Benutzer.
+rm -f /etc/sudoers.d/mountbar
 
 # Fingerabdruck von anylinuxfs und util-linux festhalten. Der Helfer verweigert
 # danach jeden Dienst, sobald sich dort etwas ändert.

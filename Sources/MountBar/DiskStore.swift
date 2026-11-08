@@ -12,6 +12,7 @@ final class DiskStore: ObservableObject {
     @Published var helperReady = Helper.isInstalled && !Helper.isOutdated
     @Published var anylinuxfsMissing = false
     @Published var untrusted = false
+    @Published var untrustedDetail = ""
     @Published var language: Language {
         didSet {
             L.language = language
@@ -36,11 +37,16 @@ final class DiskStore: ObservableObject {
     private var watcher: DiskWatcher?
     private var statusTimer: Timer?
     private var knownDisks: Set<String> = []
+    private var scanTask: Task<Void, Never>?
+    private var rescanRequested = false
 
     var hasMounts: Bool { !mounts.isEmpty }
 
     init() {
-        UserDefaults.standard.register(defaults: ["autoMount": true, "readOnlyDefault": false, "safeUnplug": true, "openAfterMount": true, "language": "en"])
+        UserDefaults.standard.register(defaults: [
+            "autoMount": true, "readOnlyDefault": false, "safeUnplug": true,
+            "openAfterMount": true, "language": "en",
+        ])
         openAfterMount = UserDefaults.standard.bool(forKey: "openAfterMount")
         safeUnplug = UserDefaults.standard.bool(forKey: "safeUnplug")
         autoMount = UserDefaults.standard.bool(forKey: "autoMount")
@@ -83,8 +89,9 @@ final class DiskStore: ObservableObject {
         knownDisks.remove(disk)
         let stale = mounts.filter { $0.diskID == disk }
         Task {
+            // Der Helfer löst den Mount hart, weil das Gerät nicht mehr existiert.
             for m in stale {
-                _ = try? await Helper.run(["unmount", m.mountpoint], as: HelperReply.self)
+                _ = try? await Helper.run(["unmount", m.mountpoint], as: HelperReply.self, timeout: 150)
             }
             await scan()
         }
@@ -92,13 +99,37 @@ final class DiskStore: ObservableObject {
 
     // MARK: Aktionen
 
+    /// Gleichzeitige Anfragen werden zu höchstens einem weiteren Lauf gebündelt,
+    /// damit ein älteres Ergebnis nie ein neueres überschreibt.
     func scan() async {
-        helperReady = Helper.isInstalled && !Helper.isOutdated
-        guard helperReady else { return }
+        if let running = scanTask {
+            rescanRequested = true
+            await running.value
+            return
+        }
+        let task = Task { await self.scanLoop() }
+        scanTask = task
+        await task.value
+        scanTask = nil
+    }
+
+    private func scanLoop() async {
+        repeat {
+            rescanRequested = false
+            await scanOnce()
+        } while rescanRequested
+    }
+
+    private func scanOnce() async {
+        guard Helper.isInstalled, !Helper.isOutdated, !untrusted else {
+            helperReady = false
+            return
+        }
+        helperReady = true
         scanning = true
         defer { scanning = false }
         do {
-            let r = try await Helper.run(["scan"], as: ScanResult.self)
+            let r = try await Helper.run(["scan"], as: ScanResult.self, timeout: 180)
             disks = r.disks
             mounts = r.mounts
             anylinuxfsMissing = !r.anylinuxfs
@@ -111,16 +142,17 @@ final class DiskStore: ObservableObject {
         switch error {
         case HelperError.notInstalled:
             helperReady = false
-        case HelperError.untrusted:
+        case HelperError.untrusted(let detail):
             helperReady = false
             untrusted = true
+            untrustedDetail = detail
         default:
             errorMessage = [prefix, error.localizedDescription].compactMap { $0 }.joined(separator: ": ")
         }
     }
 
     func refreshStatus() async {
-        guard helperReady, busy.isEmpty, !scanning else { return }
+        guard helperReady, busy.isEmpty, scanTask == nil else { return }
         guard let r = try? await Helper.run(["status"], as: StatusResult.self) else { return }
         if r.mounts != mounts {
             await scan()
@@ -129,6 +161,7 @@ final class DiskStore: ObservableObject {
 
     func mount(_ disk: Disk, _ part: Partition, readOnly: Bool? = nil) async {
         let key = Self.key(disk.disk, part.index)
+        guard !busy.contains(key) else { return }
         busy.insert(key)
         defer { busy.remove(key) }
         let ro = !part.writable || (readOnly ?? readOnlyDefault)
@@ -147,10 +180,11 @@ final class DiskStore: ObservableObject {
     }
 
     func unmount(_ mount: MountInfo, key: String, rescan: Bool = true) async {
+        guard !busy.contains(key) else { return }
         busy.insert(key)
         defer { busy.remove(key) }
         do {
-            _ = try await Helper.run(["unmount", mount.mountpoint], as: HelperReply.self)
+            _ = try await Helper.run(["unmount", mount.mountpoint], as: HelperReply.self, timeout: 150)
             errorMessage = nil
         } catch {
             handle(error)
@@ -167,7 +201,7 @@ final class DiskStore: ObservableObject {
 
     private func autoMountDisk(_ id: String) async {
         guard let disk = disks.first(where: { $0.disk == id }) else { return }
-        for part in disk.partitions where part.mountable && part.mount == nil {
+        for part in disk.partitions where part.auto && part.mount == nil {
             await mount(disk, part)
         }
     }
@@ -181,13 +215,16 @@ final class DiskStore: ObservableObject {
     }
 
     func installHelper() async {
+        let firstInstall = !Helper.isInstalled
         do {
             try await Helper.install()
+            untrusted = false
+            untrustedDetail = ""
             helperReady = Helper.isInstalled && !Helper.isOutdated
             errorMessage = nil
-            untrusted = false
             await scan()
-            if autoMount { await autoMountAll() }
+            // Nach einer Aktualisierung nichts einhängen, was der Nutzer vorher ausgeworfen hat.
+            if firstInstall && autoMount { await autoMountAll() }
         } catch {
             handle(error)
         }

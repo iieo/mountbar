@@ -26,7 +26,7 @@ sie nach `/Applications`. Nur bauen geht mit `./build.sh`, bauen und installiere
 - Beim Anmelden starten
 
 Beim ersten Start fragt die App einmal nach dem Administratorpasswort. Sie installiert dann
-`/usr/local/libexec/mountbar-helper` (gehört root) und `/etc/sudoers.d/mountbar`, das genau diesen
+`/usr/local/libexec/mountbar-helper` (gehört root) und `/etc/sudoers.d/mountbar-<benutzer>`, das genau diesen
 Helfer ohne Passwort erlaubt. Ändert sich der Helfer in einer neuen Version, bietet die App an, ihn
 zu aktualisieren.
 
@@ -51,7 +51,7 @@ Dienst, bis du in der App mit deinem Passwort neu bestätigst.
 ## Deinstallieren
 
 ```
-sudo rm /usr/local/libexec/mountbar-helper /etc/sudoers.d/mountbar
+sudo rm /usr/local/libexec/mountbar-helper /etc/sudoers.d/mountbar-$(whoami)
 sudo rm -rf /var/db/mountbar
 rm -rf /Applications/MountBar.app
 ```

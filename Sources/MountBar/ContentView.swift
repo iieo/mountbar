@@ -181,6 +181,10 @@ struct PartitionRow: View {
                     Text(part.displayName).font(.system(size: 12, weight: .medium)).lineLimit(1)
                     Tag(text: part.fsDisplay)
                     if let m = part.mount, m.readonly { Tag(text: L.t("read_only")) }
+                    if let m = part.mount, !m.readonly, !(part.syncSafe && store.safeUnplug) {
+                        Tag(text: L.t("eject_first"))
+                            .help(L.t("eject_first_hint"))
+                    }
                 }
                 Text(detail)
                     .font(.system(size: 11))
@@ -196,15 +200,19 @@ struct PartitionRow: View {
         .background(hovering ? Color.primary.opacity(0.05) : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .onHover { hovering = $0 }
         .contextMenu {
-            if part.mountable && part.mount == nil {
-                if part.writable {
-                    Button(L.t("mount_rw")) { Task { await store.mount(disk, part, readOnly: false) } }
+            if !isBusy {
+                if part.mountable && part.mount == nil {
+                    if part.writable {
+                        Button(L.t("mount_rw")) { Task { await store.mount(disk, part, readOnly: false) } }
+                    }
+                    if part.macosMount == nil {
+                        Button(L.t("mount_ro")) { Task { await store.mount(disk, part, readOnly: true) } }
+                    }
                 }
-                Button(L.t("mount_ro")) { Task { await store.mount(disk, part, readOnly: true) } }
-            }
-            if let m = part.mount {
-                Button(L.t("open_in_finder")) { store.openInFinder(m.mountpoint) }
-                Button(L.t("eject")) { Task { await store.unmount(m, key: key) } }
+                if let m = part.mount {
+                    Button(L.t("open_in_finder")) { store.openInFinder(m.mountpoint) }
+                    Button(L.t("eject")) { Task { await store.unmount(m, key: key) } }
+                }
             }
         }
     }
@@ -236,9 +244,17 @@ struct PartitionRow: View {
                     .help(L.t("eject"))
             }
         } else if let m = part.macosMount {
-            Button { store.openInFinder(m) } label: { Image(systemName: "folder") }
-                .buttonStyle(IconButtonStyle())
-                .help(L.t("open_in_finder"))
+            HStack(spacing: 4) {
+                Button { store.openInFinder(m) } label: { Image(systemName: "folder") }
+                    .buttonStyle(IconButtonStyle())
+                    .help(L.t("open_in_finder"))
+                if part.mountable && part.writable {
+                    // NTFS: macOS kann nur lesen. Auf Wunsch übernimmt anylinuxfs mit Schreibzugriff.
+                    Button(L.t("enable_write")) { Task { await store.mount(disk, part, readOnly: false) } }
+                        .buttonStyle(PillButtonStyle())
+                        .help(L.t("enable_write_hint"))
+                }
+            }
         } else if part.mountable {
             Button(L.t("mount")) { Task { await store.mount(disk, part) } }
                 .buttonStyle(PillButtonStyle())
@@ -282,7 +298,10 @@ struct SetupView: View {
     }
 
     private var text: String {
-        if store.untrusted { return L.t("setup_untrusted_text") }
+        if store.untrusted {
+            let changed = store.untrustedDetail.isEmpty ? "" : "\n\n" + L.t("changed_packages", store.untrustedDetail)
+            return L.t("setup_untrusted_text") + changed
+        }
         return Helper.isInstalled ? L.t("setup_update_text") : L.t("setup_first_text")
     }
 }

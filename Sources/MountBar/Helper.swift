@@ -2,8 +2,12 @@ import Foundation
 
 enum HelperError: LocalizedError {
     case notInstalled
-    case untrusted
+    case untrusted(String)
     case failed(code: String, detail: String = "")
+
+    /// Bei diesen Codes ist der englische Zusatz des Helfers die eigentliche Ursache
+    /// (Ausgabe von anylinuxfs oder Python). Bei allen anderen reicht der übersetzte Text.
+    private static let codesWithDetail: Set<String> = ["mount_failed", "unmount_failed", "busy", "internal", "unexpected"]
 
     var errorDescription: String? {
         switch self {
@@ -11,8 +15,9 @@ enum HelperError: LocalizedError {
         case .untrusted: return L.t("setup_untrusted_text")
         case .failed(let code, let detail):
             let base = L.t("err_\(code)")
-            if base == "err_\(code)" { return detail.isEmpty ? L.t("err_internal") : detail }
-            return detail.isEmpty ? base : "\(base): \(detail)"
+            if base == "err_\(code)" { return detail.isEmpty ? L.t("err_internal") : "\(L.t("err_internal")): \(detail)" }
+            guard Self.codesWithDetail.contains(code), !detail.isEmpty else { return base }
+            return "\(base): \(detail)"
         }
     }
 }
@@ -21,7 +26,8 @@ enum HelperError: LocalizedError {
 /// Einrichtung erlaubt genau diese eine Datei ohne Passwort.
 enum Helper {
     static let path = "/usr/local/libexec/mountbar-helper"
-    static let sudoersPath = "/etc/sudoers.d/mountbar"
+    /// Eine Datei pro Benutzer, damit sich mehrere Konten nicht gegenseitig überschreiben.
+    static var sudoersPath: String { "/etc/sudoers.d/mountbar-\(NSUserName())" }
 
     static var isInstalled: Bool {
         FileManager.default.isExecutableFile(atPath: path)
@@ -38,7 +44,7 @@ enum Helper {
         guard FileManager.default.isExecutableFile(atPath: path) else { throw HelperError.notInstalled }
         let data = try await exec("/usr/bin/sudo", ["-n", path] + args, timeout: timeout)
         if let reply = try? JSONDecoder().decode(HelperReply.self, from: data), let err = reply.error {
-            throw reply.code == "untrusted" ? HelperError.untrusted : HelperError.failed(code: reply.code ?? "internal", detail: err)
+            throw reply.code == "untrusted" ? HelperError.untrusted(err) : HelperError.failed(code: reply.code ?? "internal", detail: err)
         }
         do {
             return try JSONDecoder().decode(T.self, from: data)
@@ -54,6 +60,8 @@ enum Helper {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: tool)
                 p.arguments = args
+                // Englische sudo-Meldungen, damit die Passwort-Erkennung unten greift.
+                p.environment = ["LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
                 let out = Pipe(), err = Pipe()
                 p.standardOutput = out
                 p.standardError = err
@@ -85,7 +93,7 @@ enum Helper {
                 }
                 if data.isEmpty, p.terminationStatus != 0 {
                     let msg = String(data: errData, encoding: .utf8) ?? ""
-                    if msg.contains("password is required") || msg.contains("Passwort") {
+                    if msg.contains("password is required") || msg.contains("not allowed to execute") {
                         cont.resume(throwing: HelperError.notInstalled)
                     } else {
                         cont.resume(throwing: HelperError.failed(code: "internal", detail: msg.trimmingCharacters(in: .whitespacesAndNewlines)))

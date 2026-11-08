@@ -28,7 +28,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSAppleEventsUsageDescription</key><string>MountBar richtet damit einmalig den Helfer mit Administratorrechten ein.</string>
+    <key>NSAppleEventsUsageDescription</key><string>MountBar uses this once to set up its helper with administrator rights.</string>
 </dict>
 </plist>
 PLIST

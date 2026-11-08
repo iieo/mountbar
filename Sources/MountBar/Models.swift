@@ -47,6 +47,8 @@ struct Partition: Decodable, Identifiable, Hashable {
     var uuid: String?
     var readable: Bool
     var mountable: Bool
+    var auto: Bool
+    var syncSafe: Bool
     var writable: Bool
     var mount: MountInfo?
     var macosMount: String?
@@ -81,6 +83,18 @@ struct HelperReply: Decodable {
     var already: Bool?
 }
 
+/// Größen in der Sprache der App, nicht der des Systems (Französisch schreibt Go statt GB).
 func formatBytes(_ n: Int64) -> String {
-    ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+    let units = L.language == .fr ? ["o", "Ko", "Mo", "Go", "To", "Po"] : ["B", "KB", "MB", "GB", "TB", "PB"]
+    var value = Double(n)
+    var i = 0
+    while value >= 1000 && i < units.count - 1 {
+        value /= 1000
+        i += 1
+    }
+    let f = NumberFormatter()
+    f.locale = Locale(identifier: L.language.rawValue)
+    f.numberStyle = .decimal
+    f.maximumFractionDigits = i == 0 || value >= 100 ? 0 : 1
+    return "\(f.string(from: NSNumber(value: value)) ?? String(value)) \(units[i])"
 }

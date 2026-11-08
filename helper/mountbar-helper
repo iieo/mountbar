@@ -6,11 +6,13 @@ Befehle (Ausgabe immer JSON auf stdout):
   mount <diskN> <idx> ro|rw [sync]
                             Partition über anylinuxfs einhängen. Mit sync landet
                             jeder Schreibvorgang sofort auf dem Laufwerk.
-  unmount <mountpoint>      anylinuxfs-Mount aushängen
+  unmount <mountpoint>      anylinuxfs-Mount aushängen. Hart gelöst wird nur,
+                            wenn das Laufwerk schon abgezogen ist.
   status                    aktuelle anylinuxfs-Mounts
   trust                     Fingerabdruck der Homebrew-Werkzeuge speichern
                             (nur direkt als root, nicht über sudo)
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -37,6 +39,16 @@ TIMEOUT = 60
 
 # Dateisysteme, die anylinuxfs einhängen kann und die wir anbieten.
 MOUNTABLE = {"ext2", "ext3", "ext4", "btrfs", "xfs", "ntfs", "f2fs", "exfat", "vfat", "zfs_member"}
+# Diese kann macOS nicht selbst einhängen. Nur sie werden automatisch eingehängt,
+# sonst kämen wir dem eigenen Automount von macOS in die Quere.
+LINUX_FS = {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "zfs_member"}
+# macOS hängt sie selbst ein, wenn es die Partition sieht. Dann lassen wir die Finger davon.
+MACOS_NATIVE = {"exfat", "vfat"}
+# Kernel-Dateisysteme, die die Option sync verstehen. ntfs-3g läuft über FUSE und
+# puffert im Gast, dort hilft sync nicht.
+SYNC_CAPABLE = {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat"}
+# Beim Einhängen nur zum Lesen sonst das Journal nicht nachspielen, das würde schreiben.
+NO_REPLAY = {"ext3": "norecovery", "ext4": "norecovery", "xfs": "norecovery", "btrfs": "nologreplay"}
 
 
 class HelperFail(Exception):
@@ -71,54 +83,79 @@ def plist(cmd):
 
 # --- Vertrauen in die Homebrew-Werkzeuge ---------------------------------------
 # anylinuxfs und blkid liegen in Homebrew-Ordnern, die dem Nutzer gehören. Wir
-# merken uns beim Einrichten Inode, Größe und ctime aller beteiligten Dateien.
-# ctime kann ein normaler Nutzer nicht zurücksetzen, jede Änderung fällt also auf.
+# merken uns beim Einrichten Inode, Größe und ctime aller Dateien der beteiligten
+# Pakete. ctime kann ein normaler Nutzer nicht zurücksetzen, jede Änderung fällt auf.
+# Nur die Pakete selbst, nicht die gemeinsamen Ordner: sonst löst jedes brew install
+# eines fremden Pakets eine neue Bestätigung aus.
 
-def trust_roots():
-    roots = [f"{BREW}/bin/anylinuxfs", f"{BREW}/opt/util-linux", f"{BREW}/opt/gettext",
-             f"{BREW}/etc/anylinuxfs.toml"]
-    for link in (f"{BREW}/bin/anylinuxfs", f"{BREW}/opt/util-linux", f"{BREW}/opt/gettext"):
-        real = os.path.realpath(link)
-        if os.path.isfile(real):
-            real = os.path.dirname(os.path.dirname(real))  # Cellar/<name>/<version>
-        roots.append(real)
-    return roots
+KEG_LINKS = {
+    "anylinuxfs": f"{BREW}/bin/anylinuxfs",
+    "util-linux": f"{BREW}/opt/util-linux",
+    "gettext": f"{BREW}/opt/gettext",
+}
 
 
-def fingerprint():
-    h = hashlib.sha256()
+def keg_dir(link):
+    real = os.path.realpath(link)
+    if os.path.isfile(real):
+        real = os.path.dirname(os.path.dirname(real))  # Cellar/<name>/<version>
+    return real
 
-    def add(path):
-        try:
-            st = os.lstat(path)
-        except FileNotFoundError:
-            h.update(f"{path}\0missing\n".encode())
-            return
-        target = os.readlink(path) if os.path.islink(path) else ""
-        h.update(f"{path}\0{st.st_dev}\0{st.st_ino}\0{st.st_size}\0{st.st_ctime_ns}\0"
-                 f"{st.st_mode}\0{st.st_uid}\0{target}\n".encode())
 
-    for root in trust_roots():
-        add(root)
-        if os.path.isdir(root) and not os.path.islink(root):
+def _stat_line(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return f"{path}\0missing\n"
+    target = os.readlink(path) if os.path.islink(path) else ""
+    return (f"{path}\0{st.st_dev}\0{st.st_ino}\0{st.st_size}\0{st.st_ctime_ns}\0"
+            f"{st.st_mode}\0{st.st_uid}\0{target}\n")
+
+
+def keg_fingerprints():
+    result = {}
+    for name, link in KEG_LINKS.items():
+        h = hashlib.sha256()
+        h.update(_stat_line(link).encode())
+        root = keg_dir(link)
+        h.update(_stat_line(root).encode())
+        if os.path.isdir(root):
             for d, dirs, files in os.walk(root):
                 dirs.sort()
-                for name in sorted(dirs + files):
-                    add(os.path.join(d, name))
-    # Auch die Ordner darüber: wer sie umbenennt, könnte ganze Bäume austauschen.
-    for p in (BREW, f"{BREW}/bin", f"{BREW}/opt", f"{BREW}/Cellar", f"{BREW}/etc"):
-        add(p)
-    return h.hexdigest()
+                for n in sorted(dirs + files):
+                    h.update(_stat_line(os.path.join(d, n)).encode())
+        result[name] = {"version": os.path.basename(root), "fp": h.hexdigest()}
+    cfg = f"{BREW}/etc/anylinuxfs.toml"
+    result["anylinuxfs.toml"] = {"version": "", "fp": hashlib.sha256(_stat_line(cfg).encode()).hexdigest()}
+    return result
+
+
+def trust_changes():
+    """Liste der geänderten Pakete, leer wenn alles passt."""
+    try:
+        with open(TRUST_FILE) as f:
+            saved = json.load(f).get("kegs") or {}
+    except (OSError, ValueError):
+        saved = {}
+    changes = []
+    for name, now in keg_fingerprints().items():
+        old = saved.get(name)
+        if not old or old.get("fp") != now["fp"]:
+            if old and old.get("version") != now["version"]:
+                changes.append(f"{name} {old.get('version')} → {now['version']}")
+            else:
+                changes.append(f"{name} {now['version']}".strip())
+    return changes
+
+
+def is_trusted():
+    return not trust_changes()
 
 
 def check_trust():
-    try:
-        with open(TRUST_FILE) as f:
-            saved = json.load(f).get("fingerprint")
-    except (OSError, ValueError):
-        saved = None
-    if saved != fingerprint():
-        raise HelperFail("anylinuxfs or util-linux changed, for example after an update", "untrusted")
+    changes = trust_changes()
+    if changes:
+        raise HelperFail(", ".join(changes), "untrusted")
 
 
 def cmd_trust():
@@ -127,10 +164,39 @@ def cmd_trust():
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     tmp = TRUST_FILE + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"fingerprint": fingerprint()}, f)
+        json.dump({"kegs": keg_fingerprints()}, f)
     os.chmod(tmp, 0o600)
     os.replace(tmp, TRUST_FILE)
     out({"ok": True})
+
+
+def write_json_atomic(path, obj):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+class DiskLock:
+    """Verhindert, dass zwei Aufrufe gleichzeitig dasselbe Laufwerk ein- oder aushängen."""
+
+    def __init__(self, disk):
+        self.path = os.path.join(STATE_DIR, f"{disk}.lock")
+
+    def __enter__(self):
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self.fd)
+            raise HelperFail("another operation on this disk is running", "busy")
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
 
 
 # --- Lesen vom Rohgerät -------------------------------------------------------
@@ -241,9 +307,7 @@ def find_readable_end(rdev, size, bs, sector0):
     cache = dict(list(cache.items())[-31:])
     cache[key] = result
     try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        with open(PROBE_CACHE, "w") as f:
-            json.dump(cache, f)
+        write_json_atomic(PROBE_CACHE, cache)
     except OSError:
         pass
     return result
@@ -268,6 +332,23 @@ def anylinuxfs_mounts():
             mounts.append({"source": m.group(1), "mountpoint": m.group(2), "fstype": m.group(3),
                            "readonly": "ro" in opts})
     return mounts
+
+
+NFS_RE = re.compile(r"^(\S+):(/\S*) on (/.+) \(nfs")
+
+
+def system_nfs_mounts():
+    """NFS-Mounts von anylinuxfs laut macOS, ohne anylinuxfs selbst zu starten."""
+    try:
+        r = run(["/sbin/mount", "-t", "nfs"], timeout=10)
+    except subprocess.TimeoutExpired:
+        return []
+    found = []
+    for line in r.stdout.splitlines():
+        m = NFS_RE.match(line.strip())
+        if m and m.group(1).endswith(".local") and m.group(2).startswith("/mnt/"):
+            found.append({"server": m.group(1), "mountpoint": m.group(3)})
+    return found
 
 
 def overlay_path(disk, idx):
@@ -305,6 +386,14 @@ def scan_disk(disk, mounts):
         macos_mount = None
         if direct:
             macos_mount = (plist([DISKUTIL, "info", "-plist", f"{disk}s{p['index']}"]) or {}).get("MountPoint") or None
+        mountable = fstype in MOUNTABLE and ok
+        if direct and fstype in MACOS_NATIVE:
+            mountable = False  # macOS kümmert sich selbst darum
+        if macos_mount and fstype != "ntfs":
+            mountable = False
+        # NTFS hängt macOS nur lesend ein. Schreibzugriff gibt es auf Wunsch über
+        # anylinuxfs, aber nie automatisch, sonst kollidieren wir mit macOS.
+        auto = mountable and (fstype in LINUX_FS or not direct)
         result_parts.append({
             "index": p["index"],
             "start": p["start"],
@@ -314,7 +403,9 @@ def scan_disk(disk, mounts):
             "label": probe.get("LABEL"),
             "uuid": probe.get("UUID"),
             "readable": ok,
-            "mountable": bool(fstype in MOUNTABLE and ok and not macos_mount),
+            "mountable": bool(mountable),
+            "auto": bool(auto),
+            "syncSafe": fstype in SYNC_CAPABLE,
             "writable": bool(direct),
             "mount": mount_source_for(disk, p["index"], mounts),
             "macosMount": macos_mount,
@@ -409,11 +500,6 @@ def last_line(r):
     return lines[-1] if lines else ""
 
 
-# Kernel-Dateisysteme, die die Option sync verstehen. ntfs-3g läuft über FUSE und
-# schreibt ohnehin ohne großen Zwischenspeicher durch.
-SYNC_CAPABLE = {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "vfat", "exfat"}
-
-
 def cmd_mount(disk, idx, mode, sync=False):
     if not DISK_RE.match(disk) or disk not in external_disks():
         raise HelperFail("unknown or not an external disk", "unknown_disk")
@@ -425,7 +511,11 @@ def cmd_mount(disk, idx, mode, sync=False):
     if not os.path.exists(ANYLINUXFS):
         raise HelperFail("anylinuxfs is not installed", "no_anylinuxfs")
     check_trust()
+    with DiskLock(disk):
+        _mount_locked(disk, idx, mode, sync)
 
+
+def _mount_locked(disk, idx, mode, sync):
     d = scan_disk(disk, anylinuxfs_mounts())
     part = next((p for p in d["partitions"] if p["index"] == idx), None)
     if not part:
@@ -453,9 +543,18 @@ def cmd_mount(disk, idx, mode, sync=False):
         write_qcow2(ov, f"/dev/r{disk}", vsize)
         ident = f"{ov}@s{idx}"
 
+    if part["macosMount"]:
+        # Nur bei NTFS möglich: den Nur-Lesen-Mount von macOS lösen, damit anylinuxfs
+        # das Laufwerk exklusiv bekommt.
+        r = run([DISKUTIL, "unmount", f"/dev/{disk}s{idx}"], timeout=60)
+        if r.returncode != 0:
+            raise HelperFail(last_line(r), "busy")
+
     opts = ["ro"] if mode == "ro" else ["rw"]
     if mode == "rw" and sync and part["fstype"] in SYNC_CAPABLE:
         opts.append("sync")
+    if mode == "ro" and part["fstype"] in NO_REPLAY:
+        opts.append(NO_REPLAY[part["fstype"]])
     cmd = [ANYLINUXFS, "mount", "-o", ",".join(opts), ident]
     r = run(cmd, timeout=300)
     m = mount_source_for(disk, idx, anylinuxfs_mounts())
@@ -464,23 +563,49 @@ def cmd_mount(disk, idx, mode, sync=False):
     out({"ok": True, "mountpoint": m["mountpoint"], "readonly": m["readonly"]})
 
 
+def disk_of(source):
+    m = re.search(r"disk[0-9]+", source)
+    return m.group(0) if m else None
+
+
 def cmd_unmount(mountpoint):
+    mountpoint = mountpoint.rstrip("/")
+    if not is_trusted():
+        # anylinuxfs nicht als root starten. Aushängen geht trotzdem über macOS,
+        # damit ein abgezogenes Laufwerk keinen hängenden Mount hinterlässt.
+        nfs = next((x for x in system_nfs_mounts() if x["mountpoint"] == mountpoint), None)
+        if not nfs:
+            raise HelperFail("no anylinuxfs mount at this path", "no_mount")
+        disk = disk_of(nfs["server"])
+        gone = bool(disk) and not os.path.exists(f"/dev/{disk}")
+        r = run(["/sbin/umount"] + (["-f"] if gone else []) + [mountpoint], timeout=30)
+        if r.returncode != 0:
+            raise HelperFail(last_line(r), "busy")
+        out({"ok": True})
+
     # Kein realpath: ein NFS-Mount eines abgezogenen Laufwerks würde dabei hängen.
-    m = next((x for x in anylinuxfs_mounts() if x["mountpoint"] == mountpoint.rstrip("/")), None)
+    m = next((x for x in anylinuxfs_mounts() if x["mountpoint"] == mountpoint), None)
     if not m:
         raise HelperFail("no anylinuxfs mount at this path", "no_mount")
-    check_trust()
+    disk = disk_of(m["source"].split("/")[-1]) or "unknown"
+    with DiskLock(disk):
+        _unmount_locked(m, disk)
+
+
+def _unmount_locked(m, disk):
     try:
-        r = run([ANYLINUXFS, "unmount", "--wait-for-vm", "30", m["mountpoint"]], timeout=90)
+        r = run([ANYLINUXFS, "unmount", "--wait-for-vm", "20", m["mountpoint"]], timeout=60)
         failed = r.returncode != 0
     except subprocess.TimeoutExpired:
         r, failed = None, True
     if failed:
-        # Typisch nach dem Abziehen: Die VM ist weg, der NFS-Mount hängt noch.
-        # Dann den Mount hart lösen und die VM ihrerseits aufräumen lassen.
+        # Hart lösen nur, wenn das Laufwerk schon weg ist. Ist es noch da, schreibt
+        # vermutlich gerade ein Programm darauf, und -f würde diese Daten verwerfen.
+        if os.path.exists(f"/dev/{disk}"):
+            raise HelperFail(last_line(r) if r else "timeout", "busy")
         try:
-            run(["/sbin/umount", "-f", m["mountpoint"]], timeout=30)
-            run([ANYLINUXFS, "unmount", m["mountpoint"]], timeout=30)
+            run(["/sbin/umount", "-f", m["mountpoint"]], timeout=20)
+            run([ANYLINUXFS, "unmount", m["mountpoint"]], timeout=20)
         except subprocess.TimeoutExpired:
             pass
         if any(x["mountpoint"] == m["mountpoint"] for x in anylinuxfs_mounts()):
@@ -500,6 +625,8 @@ def main():
     args = sys.argv[1:]
     if args == ["trust"]:
         cmd_trust()
+    if len(args) == 2 and args[0] == "unmount":
+        cmd_unmount(args[1])  # prüft das Vertrauen selbst, aushängen muss immer gehen
     check_trust()
     if args == ["scan"]:
         cmd_scan()
@@ -507,8 +634,6 @@ def main():
         out({"mounts": anylinuxfs_mounts()})
     elif len(args) in (4, 5) and args[0] == "mount" and (len(args) == 4 or args[4] == "sync"):
         cmd_mount(args[1], args[2], args[3], sync=len(args) == 5)
-    elif len(args) == 2 and args[0] == "unmount":
-        cmd_unmount(args[1])
     else:
         raise HelperFail("unknown command", "bad_command")
 
