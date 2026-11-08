@@ -294,6 +294,8 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle(L.t("auto_mount"), isOn: $store.autoMount)
                 .toggleStyle(.switch)
+            Toggle(L.t("open_after_mount"), isOn: $store.openAfterMount)
+                .toggleStyle(.switch)
             Toggle(L.t("safe_unplug"), isOn: $store.safeUnplug)
                 .toggleStyle(.switch)
             Text(L.t("safe_unplug_hint"))

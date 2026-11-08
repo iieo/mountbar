@@ -78,6 +78,7 @@ struct HelperReply: Decodable {
     var error: String?
     var code: String?
     var mountpoint: String?
+    var already: Bool?
 }
 
 func formatBytes(_ n: Int64) -> String {

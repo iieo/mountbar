@@ -16,6 +16,8 @@ sie nach `/Applications`. Nur bauen geht mit `./build.sh`, bauen und installiere
 ## Einstellungen
 
 - Automatisch einhängen beim Anstecken (an)
+- Nach dem Einhängen im Finder öffnen (an): Der Finder zeigt anylinuxfs-Mounts als Server wie
+  `disk16s1.local`, deshalb öffnet die App den Ordner des Laufwerks direkt.
 - Abziehen ohne Auswerfen (an): Linux-Dateisysteme werden mit `sync` eingehängt, jede Änderung
   landet sofort auf dem Laufwerk. Wer mitten im Kopieren abzieht, verliert trotzdem die Datei, die
   gerade geschrieben wird.

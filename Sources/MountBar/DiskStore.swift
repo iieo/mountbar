@@ -22,6 +22,9 @@ final class DiskStore: ObservableObject {
     @Published var autoMount: Bool {
         didSet { UserDefaults.standard.set(autoMount, forKey: "autoMount") }
     }
+    @Published var openAfterMount: Bool {
+        didSet { UserDefaults.standard.set(openAfterMount, forKey: "openAfterMount") }
+    }
     @Published var safeUnplug: Bool {
         didSet { UserDefaults.standard.set(safeUnplug, forKey: "safeUnplug") }
     }
@@ -37,7 +40,8 @@ final class DiskStore: ObservableObject {
     var hasMounts: Bool { !mounts.isEmpty }
 
     init() {
-        UserDefaults.standard.register(defaults: ["autoMount": true, "readOnlyDefault": false, "safeUnplug": true, "language": "en"])
+        UserDefaults.standard.register(defaults: ["autoMount": true, "readOnlyDefault": false, "safeUnplug": true, "openAfterMount": true, "language": "en"])
+        openAfterMount = UserDefaults.standard.bool(forKey: "openAfterMount")
         safeUnplug = UserDefaults.standard.bool(forKey: "safeUnplug")
         autoMount = UserDefaults.standard.bool(forKey: "autoMount")
         readOnlyDefault = UserDefaults.standard.bool(forKey: "readOnlyDefault")
@@ -131,9 +135,11 @@ final class DiskStore: ObservableObject {
         do {
             var args = ["mount", disk.disk, String(part.index), ro ? "ro" : "rw"]
             if !ro && safeUnplug { args.append("sync") }
-            _ = try await Helper.run(args,
-                                     as: HelperReply.self, timeout: 330)
+            let reply = try await Helper.run(args, as: HelperReply.self, timeout: 330)
             errorMessage = nil
+            if openAfterMount, reply.already != true, let mp = reply.mountpoint {
+                openInFinder(mp)
+            }
         } catch {
             handle(error, prefix: part.displayName)
         }

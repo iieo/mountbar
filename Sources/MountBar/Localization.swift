@@ -100,6 +100,8 @@ enum L {
         "default_access": [.en: "Default access", .de: "Standardzugriff", .fr: "Accès par défaut", .es: "Acceso por defecto"],
         "access_rw": [.en: "Read & write", .de: "Lesen & schreiben", .fr: "Lecture & écriture", .es: "Lectura y escritura"],
         "access_ro": [.en: "Read only", .de: "Nur lesen", .fr: "Lecture seule", .es: "Solo lectura"],
+        "open_after_mount": [.en: "Open in Finder after mounting", .de: "Nach dem Einhängen im Finder öffnen",
+                             .fr: "Ouvrir dans le Finder après le montage", .es: "Abrir en Finder tras montar"],
         "safe_unplug": [.en: "Safe to unplug without ejecting", .de: "Abziehen ohne Auswerfen erlauben",
                         .fr: "Débrancher sans éjecter", .es: "Desconectar sin expulsar"],
         "safe_unplug_hint": [
