@@ -103,6 +103,13 @@ enum L {
         "access_ro": [.en: "Read only", .de: "Nur lesen", .fr: "Lecture seule", .es: "Solo lectura"],
         "open_after_mount": [.en: "Open in Finder after mounting", .de: "Nach dem Einhängen im Finder öffnen",
                              .fr: "Ouvrir dans le Finder après le montage", .es: "Abrir en Finder tras montar"],
+        "full_access": [.en: "Full access to all files", .de: "Voller Zugriff auf alle Dateien",
+                        .fr: "Accès complet à tous les fichiers", .es: "Acceso total a todos los archivos"],
+        "full_access_hint": [
+            .en: "All files appear as yours, even if they belong to another user on Linux. Applies on the next mount.",
+            .de: "Alle Dateien erscheinen als deine, auch wenn sie unter Linux einem anderen Benutzer gehören. Gilt ab dem nächsten Einhängen.",
+            .fr: "Tous les fichiers t’appartiennent, même s’ils sont à un autre utilisateur sous Linux. S’applique au prochain montage.",
+            .es: "Todos los archivos aparecen como tuyos, aunque en Linux pertenezcan a otro usuario. Se aplica en el próximo montaje."],
         "safe_unplug": [.en: "Safe to unplug without ejecting", .de: "Abziehen ohne Auswerfen erlauben",
                         .fr: "Débrancher sans éjecter", .es: "Desconectar sin expulsar"],
         "safe_unplug_hint": [

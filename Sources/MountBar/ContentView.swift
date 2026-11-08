@@ -336,6 +336,11 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             SwitchRow(L.t("auto_mount"), isOn: $store.autoMount)
             SwitchRow(L.t("open_after_mount"), isOn: $store.openAfterMount)
+            SwitchRow(L.t("full_access"), isOn: $store.fullAccess)
+            Text(L.t("full_access_hint"))
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             SwitchRow(L.t("safe_unplug"), isOn: $store.safeUnplug)
             Text(L.t("safe_unplug_hint"))
                 .font(.system(size: 10))

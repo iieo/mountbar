@@ -18,6 +18,9 @@ sie nach `/Applications`. Nur bauen geht mit `./build.sh`, bauen und installiere
 - Automatisch einhängen beim Anstecken (an)
 - Nach dem Einhängen im Finder öffnen (an): Der Finder zeigt anylinuxfs-Mounts als Server wie
   `disk16s1.local`, deshalb öffnet die App den Ordner des Laufwerks direkt.
+- Voller Zugriff auf alle Dateien (an): `--ignore-permissions` von anylinuxfs. Linux-Dateien gehören
+  meist UID 1000, der Mac-Nutzer hat 501. Ohne die Option darf man sie im Finder nicht ändern oder
+  löschen.
 - Abziehen ohne Auswerfen (an): Linux-Dateisysteme werden mit `sync` eingehängt, jede Änderung
   landet sofort auf dem Laufwerk. Wer mitten im Kopieren abzieht, verliert trotzdem die Datei, die
   gerade geschrieben wird.

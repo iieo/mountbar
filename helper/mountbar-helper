@@ -3,9 +3,10 @@
 
 Befehle (Ausgabe immer JSON auf stdout):
   scan                      externe Laufwerke, Partitionen und Mounts
-  mount <diskN> <idx> ro|rw [sync]
+  mount <diskN> <idx> ro|rw [sync] [owner]
                             Partition über anylinuxfs einhängen. Mit sync landet
-                            jeder Schreibvorgang sofort auf dem Laufwerk.
+                            jeder Schreibvorgang sofort auf dem Laufwerk. Mit owner
+                            erscheinen alle Dateien als Eigentum des Nutzers.
   unmount <mountpoint>      anylinuxfs-Mount aushängen. Hart gelöst wird nur,
                             wenn das Laufwerk schon abgezogen ist.
   status                    aktuelle anylinuxfs-Mounts
@@ -552,7 +553,7 @@ def last_line(r):
     return lines[-1] if lines else ""
 
 
-def cmd_mount(disk, idx, mode, sync=False):
+def cmd_mount(disk, idx, mode, sync=False, owner=False):
     if not DISK_RE.match(disk) or disk not in external_disks():
         raise HelperFail("unknown or not an external disk", "unknown_disk")
     if not idx.isdigit():
@@ -564,10 +565,10 @@ def cmd_mount(disk, idx, mode, sync=False):
         raise HelperFail("anylinuxfs is not installed", "no_anylinuxfs")
     check_trust()
     with DiskLock(disk):
-        _mount_locked(disk, idx, mode, sync)
+        _mount_locked(disk, idx, mode, sync, owner)
 
 
-def _mount_locked(disk, idx, mode, sync):
+def _mount_locked(disk, idx, mode, sync, owner):
     d = scan_disk(disk, anylinuxfs_mounts())
     part = next((p for p in d["partitions"] if p["index"] == idx), None)
     if not part:
@@ -609,7 +610,12 @@ def _mount_locked(disk, idx, mode, sync):
         opts.append("sync")
     if mode == "ro" and part["fstype"] in NO_REPLAY:
         opts.append(NO_REPLAY[part["fstype"]])
-    cmd = [ANYLINUXFS, "mount", "-o", ",".join(opts), ident]
+    cmd = [ANYLINUXFS, "mount", "-o", ",".join(opts)]
+    if owner:
+        # Linux-Dateien gehören meist UID 1000, der Mac-Nutzer hat 501. Ohne diese
+        # Option darf man im Finder fremde Dateien weder ändern noch löschen.
+        cmd.append("--ignore-permissions")
+    cmd.append(ident)
     try:
         r = run(cmd, timeout=300)
         m = mount_source_for(disk, idx, anylinuxfs_mounts())
@@ -701,8 +707,8 @@ def main():
         cmd_scan()
     elif args == ["status"]:
         out({"mounts": anylinuxfs_mounts()})
-    elif len(args) in (4, 5) and args[0] == "mount" and (len(args) == 4 or args[4] == "sync"):
-        cmd_mount(args[1], args[2], args[3], sync=len(args) == 5)
+    elif len(args) >= 4 and args[0] == "mount" and set(args[4:]) <= {"sync", "owner"}:
+        cmd_mount(args[1], args[2], args[3], sync="sync" in args[4:], owner="owner" in args[4:])
     else:
         raise HelperFail("unknown command", "bad_command")
 
