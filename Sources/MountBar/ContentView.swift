@@ -39,7 +39,7 @@ struct ContentView: View {
             footer
         }
         .frame(width: 360)
-        .task { await store.scan() }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var header: some View {
@@ -110,14 +110,25 @@ struct ContentView: View {
 struct Scrollable<Content: View>: View {
     var maxHeight: CGFloat = 440
     @ViewBuilder var content: Content
+    @State private var contentHeight: CGFloat = 0
 
     var body: some View {
-        ViewThatFits(in: .vertical) {
+        ScrollView {
             content
-            ScrollView { content }.frame(height: maxHeight)
+                .fixedSize(horizontal: false, vertical: true)
+                .background(GeometryReader { geo in
+                    Color.clear.preference(key: ContentHeightKey.self, value: geo.size.height)
+                })
         }
-        .frame(maxHeight: maxHeight)
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(height: min(max(contentHeight, 1), maxHeight))
+        .onPreferenceChange(ContentHeightKey.self) { contentHeight = $0 }
     }
+}
+
+private struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 struct DiskCard: View {
@@ -323,21 +334,17 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Toggle(L.t("auto_mount"), isOn: $store.autoMount)
-                .toggleStyle(.switch)
-            Toggle(L.t("open_after_mount"), isOn: $store.openAfterMount)
-                .toggleStyle(.switch)
-            Toggle(L.t("safe_unplug"), isOn: $store.safeUnplug)
-                .toggleStyle(.switch)
+            SwitchRow(L.t("auto_mount"), isOn: $store.autoMount)
+            SwitchRow(L.t("open_after_mount"), isOn: $store.openAfterMount)
+            SwitchRow(L.t("safe_unplug"), isOn: $store.safeUnplug)
             Text(L.t("safe_unplug_hint"))
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Toggle(L.t("launch_at_login"), isOn: Binding(
+            SwitchRow(L.t("launch_at_login"), isOn: Binding(
                 get: { store.launchAtLogin },
                 set: { store.setLaunchAtLogin($0) }
             ))
-            .toggleStyle(.switch)
 
             HStack {
                 Text(L.t("default_access"))
@@ -363,6 +370,26 @@ struct SettingsView: View {
         .controlSize(.small)
         .font(.system(size: 11))
         .padding(12)
+    }
+}
+
+struct SwitchRow: View {
+    let title: String
+    @Binding var isOn: Bool
+
+    init(_ title: String, isOn: Binding<Bool>) {
+        self.title = title
+        self._isOn = isOn
+    }
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer(minLength: 8)
+            Toggle("", isOn: $isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
     }
 }
 
